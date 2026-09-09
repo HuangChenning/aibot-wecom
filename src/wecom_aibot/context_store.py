@@ -45,9 +45,14 @@ class ContextStore:
         record = self._by_token.get(token)
         if record is None:
             return Claim(status="missing")
-        if now > record.expires_at:
+        if now >= record.expires_at:
             return Claim(status="expired")
         if record.final_state == "delivered":
             return Claim(status="delivered")
-        record.final_state = "delivered"
         return Claim(status="ready")
+
+    def mark_delivered(self, token: str, now: float) -> None:
+        record = self._by_token.get(token)
+        if record is None or now >= record.expires_at:
+            return
+        record.final_state = "delivered"
