@@ -2,3 +2,5 @@
 docs/
 AGENTS.md
 CLAUDE.md
+internal/
+rules/
