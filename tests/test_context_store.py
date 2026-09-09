@@ -29,3 +29,13 @@ def test_final_claim_is_idempotent_after_delivery():
 def test_missing_context_is_rejected():
     store = ContextStore(ttl_seconds=60)
     assert store.claim_final("unknown-token", 100.0).status == "missing"
+
+
+def test_relay_internal_route_access_hides_expired_and_missing_routes():
+    store = ContextStore(ttl_seconds=60)
+    route = object()
+    token = store.issue("event-1", route, 100.0)
+
+    assert store.route_for_relay(token, 159.0) is route
+    assert store.route_for_relay(token, 160.0) is None
+    assert store.route_for_relay("unknown-token", 100.0) is None

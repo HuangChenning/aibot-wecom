@@ -51,6 +51,13 @@ class ContextStore:
             return Claim(status="delivered")
         return Claim(status="ready")
 
+    def route_for_relay(self, token: str, now: float) -> object | None:
+        """Return an active route for relay-internal delivery only."""
+        record = self._by_token.get(token)
+        if record is None or now >= record.expires_at:
+            return None
+        return record.route
+
     def mark_delivered(self, token: str, now: float) -> None:
         record = self._by_token.get(token)
         if record is None or now >= record.expires_at:
