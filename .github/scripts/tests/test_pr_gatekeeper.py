@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import json
 from subprocess import CalledProcessError
 from pathlib import Path
 from urllib.error import URLError
@@ -15,6 +16,7 @@ from pr_gatekeeper import (
     make_model_request,
     parse_model_verdict,
     publish_report,
+    run_gatekeeper,
     truncate_text,
 )
 from pr_gatekeeper import deterministic_verdict
@@ -109,3 +111,102 @@ class ReportingTests(unittest.TestCase):
 
             self.assertEqual("comment_failed", status)
             self.assertEqual("report", summary.read_text(encoding="utf-8"))
+
+
+class EntrypointTests(unittest.TestCase):
+    def test_entrypoint_writes_mergeable_verdict_for_current_head(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            self._write_evidence(evidence, {"ruff": 0, "pytest": 0})
+
+            code = run_gatekeeper(
+                self._environment("head"),
+                evidence,
+                evidence / "summary.md",
+                runner=self._gh_returning("head"),
+                opener=self._mergeable_minimax,
+            )
+
+            self.assertEqual(0, code)
+            verdict = json.loads((evidence / "verdict.json").read_text())
+            self.assertEqual("MERGEABLE", verdict["verdict"])
+
+    def test_entrypoint_blocks_when_head_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            self._write_evidence(evidence, {"ruff": 0, "pytest": 0})
+
+            code = run_gatekeeper(
+                self._environment("before"),
+                evidence,
+                evidence / "summary.md",
+                runner=self._gh_returning("after"),
+                opener=self._mergeable_minimax,
+            )
+
+            self.assertEqual(1, code)
+            verdict = json.loads((evidence / "verdict.json").read_text())
+            self.assertEqual("NOT_MERGEABLE", verdict["verdict"])
+
+    def test_entrypoint_blocks_malformed_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            self._write_evidence(evidence, {"ruff": 0, "pytest": 0})
+            (evidence / "pr_meta.json").write_text("[]")
+
+            code = run_gatekeeper(
+                self._environment("head"),
+                evidence,
+                evidence / "summary.md",
+                runner=self._gh_returning("head"),
+                opener=self._mergeable_minimax,
+            )
+
+            self.assertEqual(1, code)
+            verdict = json.loads((evidence / "verdict.json").read_text())
+            self.assertEqual("INCONCLUSIVE", verdict["verdict"])
+
+    @staticmethod
+    def _write_evidence(evidence: Path, exit_codes: dict[str, int]) -> None:
+        (evidence / "exit-codes.json").write_text(json.dumps(exit_codes))
+        (evidence / "ruff.log").write_text("ruff passed")
+        (evidence / "pytest.log").write_text("pytest passed")
+        (evidence / "pr_meta.json").write_text('{"title":"title","body":"body"}')
+        (evidence / "pr_diff.patch").write_text("diff")
+
+    @staticmethod
+    def _environment(initial_sha: str) -> dict[str, str]:
+        return {
+            "INITIAL_SHA": initial_sha,
+            "PR_NUMBER": "42",
+            "MINIMAX_API_KEY": "secret-value",
+            "MINIMAX_BASE_URL": "https://example.invalid/v1",
+            "MINIMAX_MODEL": "model",
+        }
+
+    @staticmethod
+    def _gh_returning(head: str):
+        class Result:
+            def __init__(self, stdout: str) -> None:
+                self.stdout = stdout
+
+        def runner(args: list[str], **_kwargs: object) -> Result:
+            if "view" in args:
+                return Result(head)
+            return Result("")
+
+        return runner
+
+    @staticmethod
+    def _mergeable_minimax(*_args: object, **_kwargs: object) -> object:
+        class Response:
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"choices":[{"message":{"content":"{\\"verdict\\":\\"MERGEABLE\\",\\"acceptance_criteria\\":[],\\"observations\\":[]}"}}]}'
+
+        return Response()
