@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import ntpath
 import os
 import socket
 import stat
@@ -16,7 +17,8 @@ from wecom_aibot.service import RelayService
 
 MAX_REQUEST_BYTES = 64 * 1024
 IO_TIMEOUT_SECONDS = 0.25
-SHUTDOWN_TIMEOUT_SECONDS = 0.25
+DELIVERY_RESPONSE_TIMEOUT_SECONDS = 120
+SHUTDOWN_TIMEOUT_SECONDS = 5
 _WINDOWS_TOKEN_SDDL = "D:P(A;;FA;;;OW)"
 _SO_EXCLUSIVEADDRUSE = getattr(socket, "SO_EXCLUSIVEADDRUSE", -5)
 
@@ -28,7 +30,7 @@ def _windows_bind_address() -> tuple[str, int]:
 def _delivery_response(result: DeliveryResult) -> dict[str, object]:
     if result.status == "delivered":
         return {"status": "delivered"}
-    if result.status == "unknown":
+    if result.status != "not_delivered":
         return {"status": "unknown", "reason": "delivery_unknown"}
     reason = result.reason if result.reason in {"expired", "missing"} else "delivery_failed"
     return {"status": "not_delivered", "reason": reason}
@@ -157,15 +159,210 @@ def _write_windows_token_file(path: str, token: str) -> None:
         raise
 
 
+def _inspect_windows_token_parent(parent: str) -> tuple[bool, bool]:
+    import ctypes
+    from ctypes import wintypes
+
+    class SidAndAttributes(ctypes.Structure):
+        _fields_ = [
+            ("Sid", wintypes.LPVOID),
+            ("Attributes", wintypes.DWORD),
+        ]
+
+    class TokenUser(ctypes.Structure):
+        _fields_ = [("User", SidAndAttributes)]
+
+    class Acl(ctypes.Structure):
+        _fields_ = [
+            ("AclRevision", wintypes.BYTE),
+            ("Sbz1", wintypes.BYTE),
+            ("AclSize", wintypes.WORD),
+            ("AceCount", wintypes.WORD),
+            ("Sbz2", wintypes.WORD),
+        ]
+
+    class AceHeader(ctypes.Structure):
+        _fields_ = [
+            ("AceType", wintypes.BYTE),
+            ("AceFlags", wintypes.BYTE),
+            ("AceSize", wintypes.WORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+
+    get_attributes = kernel32.GetFileAttributesW
+    get_attributes.argtypes = [wintypes.LPCWSTR]
+    get_attributes.restype = wintypes.DWORD
+    attributes = get_attributes(parent)
+    if attributes == 0xFFFFFFFF:
+        raise ctypes.WinError(ctypes.get_last_error())
+    is_reparse = bool(attributes & 0x400)
+    if is_reparse:
+        return (True, False)
+    if not attributes & 0x10:
+        return (False, False)
+
+    get_current_process = kernel32.GetCurrentProcess
+    get_current_process.restype = wintypes.HANDLE
+    open_process_token = advapi32.OpenProcessToken
+    open_process_token.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    open_process_token.restype = wintypes.BOOL
+    token = wintypes.HANDLE()
+    if not open_process_token(get_current_process(), 0x0008, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    security_descriptor = wintypes.LPVOID()
+    try:
+        get_token_information = advapi32.GetTokenInformation
+        get_token_information.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        get_token_information.restype = wintypes.BOOL
+        required = wintypes.DWORD()
+        get_token_information(token, 1, None, 0, ctypes.byref(required))
+        if not required.value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        token_buffer = ctypes.create_string_buffer(required.value)
+        if not get_token_information(
+            token,
+            1,
+            token_buffer,
+            required.value,
+            ctypes.byref(required),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        current_sid = ctypes.cast(
+            token_buffer,
+            ctypes.POINTER(TokenUser),
+        ).contents.User.Sid
+
+        owner_sid = wintypes.LPVOID()
+        dacl = wintypes.LPVOID()
+        get_security = advapi32.GetNamedSecurityInfoW
+        get_security.argtypes = [
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+        ]
+        get_security.restype = wintypes.DWORD
+        error = get_security(
+            parent,
+            1,
+            0x00000005,
+            ctypes.byref(owner_sid),
+            None,
+            ctypes.byref(dacl),
+            None,
+            ctypes.byref(security_descriptor),
+        )
+        if error:
+            raise OSError(error, "GetNamedSecurityInfoW failed")
+        if not owner_sid or not dacl:
+            return (False, False)
+
+        get_control = advapi32.GetSecurityDescriptorControl
+        get_control.argtypes = [
+            wintypes.LPVOID,
+            ctypes.POINTER(wintypes.WORD),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        get_control.restype = wintypes.BOOL
+        control = wintypes.WORD()
+        revision = wintypes.DWORD()
+        if not get_control(
+            security_descriptor,
+            ctypes.byref(control),
+            ctypes.byref(revision),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not control.value & 0x1000:
+            return (False, False)
+
+        equal_sid = advapi32.EqualSid
+        equal_sid.argtypes = [wintypes.LPVOID, wintypes.LPVOID]
+        equal_sid.restype = wintypes.BOOL
+        if not equal_sid(owner_sid, current_sid):
+            return (False, False)
+
+        get_ace = advapi32.GetAce
+        get_ace.argtypes = [
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPVOID),
+        ]
+        get_ace.restype = wintypes.BOOL
+        acl = ctypes.cast(dacl, ctypes.POINTER(Acl)).contents
+        has_owner_allow = False
+        for index in range(acl.AceCount):
+            ace = wintypes.LPVOID()
+            if not get_ace(dacl, index, ctypes.byref(ace)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            header = ctypes.cast(ace, ctypes.POINTER(AceHeader)).contents
+            if header.AceType == 1:
+                continue
+            if header.AceType != 0:
+                return (False, False)
+            ace_sid = wintypes.LPVOID(ace.value + 8)
+            if not equal_sid(ace_sid, owner_sid):
+                return (False, False)
+            has_owner_allow = True
+        return (False, has_owner_allow)
+    finally:
+        if security_descriptor:
+            local_free = kernel32.LocalFree
+            local_free.argtypes = [wintypes.HLOCAL]
+            local_free.restype = wintypes.HLOCAL
+            local_free(security_descriptor)
+        close_handle(token)
+
+
+def _validate_windows_token_parent(
+    path: str,
+    *,
+    inspector: Callable[[str], tuple[bool, bool]] = _inspect_windows_token_parent,
+) -> None:
+    parent = ntpath.dirname(path) or "."
+    is_reparse, is_owner_only = inspector(parent)
+    if is_reparse:
+        raise PermissionError("Windows token parent must not be a reparse point")
+    if not is_owner_only:
+        raise PermissionError("Windows token parent must be owner-only")
+
+
 def _write_token_file(
     path: str,
     token: str,
     *,
     windows: bool | None = None,
     windows_writer: Callable[[str, str], None] = _write_windows_token_file,
+    windows_parent_inspector: Callable[
+        [str],
+        tuple[bool, bool],
+    ] = _inspect_windows_token_parent,
 ) -> None:
     use_windows = os.name == "nt" if windows is None else windows
     if use_windows:
+        _validate_windows_token_parent(
+            path,
+            inspector=windows_parent_inspector,
+        )
         windows_writer(path, token)
         return
     _write_posix_token_file(path, token)
@@ -251,6 +448,12 @@ class IpcServer:
     async def start(self, endpoint_path: str) -> None:
         if self._server is not None:
             raise RuntimeError("IPC server already started")
+        if self._close_task is not None:
+            if not self._close_task.done():
+                await asyncio.shield(self._close_task)
+            _consume_task_exception(self._close_task)
+            self._close_task = None
+        self._stop_handler = None
         listener: socket.socket | None = None
         self._closed.clear()
         token_path = f"{endpoint_path}.token"
@@ -315,7 +518,7 @@ class IpcServer:
                         self._server.wait_closed(),
                         SHUTDOWN_TIMEOUT_SECONDS,
                     )
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     pass
                 self._server = None
             raise
@@ -330,7 +533,7 @@ class IpcServer:
                     server.wait_closed(),
                     SHUTDOWN_TIMEOUT_SECONDS,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 pass
         self._remove_local_files()
         self._socket_path = None
@@ -350,7 +553,7 @@ class IpcServer:
                             server.wait_closed(),
                             SHUTDOWN_TIMEOUT_SECONDS,
                         )
-                    except TimeoutError:
+                    except asyncio.TimeoutError:
                         pass
 
                 current = asyncio.current_task()
@@ -368,6 +571,21 @@ class IpcServer:
                     )
                     for task in still_pending:
                         task.cancel()
+                    if still_pending:
+                        gathered = asyncio.gather(
+                            *still_pending,
+                            return_exceptions=True,
+                        )
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(gathered),
+                                IO_TIMEOUT_SECONDS,
+                            )
+                        except asyncio.TimeoutError:
+                            gathered.cancel()
+                            gathered.add_done_callback(
+                                _consume_task_exception
+                            )
             finally:
                 self._remove_local_files()
                 self._closed.set()
@@ -401,8 +619,7 @@ class IpcServer:
 
     def _handler_done(self, task: asyncio.Task[None]) -> None:
         self._handlers.discard(task)
-        if not task.cancelled():
-            task.exception()
+        _consume_task_exception(task)
 
     async def _dispatch(self, message: object) -> dict[str, object]:
         if not isinstance(message, dict):
@@ -436,9 +653,14 @@ class IpcServer:
         ):
             return _invalid("invalid reply fields")
         try:
-            result = await self._service.reply(context, payload["markdown"])
+            result = await asyncio.wait_for(
+                self._service.reply(context, payload["markdown"]),
+                DELIVERY_RESPONSE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            return _delivery_unknown()
         except Exception:  # noqa: BLE001
-            return _internal_error()
+            return _delivery_unknown()
         return _delivery_response(result)
 
     async def _handle_unix_connection(
@@ -455,16 +677,16 @@ class IpcServer:
                 )
             except ValueError:
                 response = _invalid("request too large")
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 return
             else:
                 response = await self._decode_and_dispatch(data)
                 should_stop = response == {"status": "stopping"}
             await self._send_unix_response(writer, response)
-        except (ConnectionError, TimeoutError):
+        except (ConnectionError, asyncio.TimeoutError):
             return
         except asyncio.CancelledError:
-            return
+            raise
         except Exception:  # noqa: BLE001
             return
         finally:
@@ -491,7 +713,7 @@ class IpcServer:
         try:
             return await self._dispatch(message)
         except Exception:  # noqa: BLE001
-            return _internal_error()
+            return _delivery_unknown()
 
     async def _handle_http_connection(
         self,
@@ -503,10 +725,10 @@ class IpcServer:
             response = await self._read_http_request(reader)
             should_stop = response == {"status": "stopping"}
             await self._send_http_response(writer, response)
-        except (ConnectionError, TimeoutError):
+        except (ConnectionError, asyncio.TimeoutError):
             return
         except asyncio.CancelledError:
-            return
+            raise
         except Exception:  # noqa: BLE001
             return
         finally:
@@ -570,16 +792,10 @@ class IpcServer:
                 reader.readexactly(content_length),
                 IO_TIMEOUT_SECONDS,
             )
-            extra = await asyncio.wait_for(
-                reader.read(1),
-                IO_TIMEOUT_SECONDS,
-            )
-            if extra:
-                return _invalid("invalid HTTP request")
         except (
             ValueError,
             asyncio.IncompleteReadError,
-            TimeoutError,
+            asyncio.TimeoutError,
         ):
             return _invalid("invalid HTTP request")
         return await self._decode_and_dispatch(body + b"\n")
@@ -602,6 +818,7 @@ class IpcServer:
     def _schedule_close(self) -> None:
         if self._close_task is None:
             self._close_task = asyncio.create_task(self.close())
+            self._close_task.add_done_callback(_consume_task_exception)
 
 
 async def request(
@@ -621,12 +838,17 @@ async def request(
         asyncio.open_unix_connection(endpoint),
         IO_TIMEOUT_SECONDS,
     )
+    response_timeout = (
+        DELIVERY_RESPONSE_TIMEOUT_SECONDS + IO_TIMEOUT_SECONDS
+        if payload.get("action") == "reply"
+        else IO_TIMEOUT_SECONDS
+    )
     try:
         writer.write(data)
         await asyncio.wait_for(writer.drain(), IO_TIMEOUT_SECONDS)
         response_data = await asyncio.wait_for(
             reader.readline(),
-            IO_TIMEOUT_SECONDS,
+            response_timeout,
         )
     finally:
         await _safe_close_writer(writer)
@@ -654,11 +876,13 @@ async def _http_request(endpoint: str, body: bytes) -> dict[str, object]:
             + body
         )
         await asyncio.wait_for(writer.drain(), IO_TIMEOUT_SECONDS)
-        if writer.can_write_eof():
-            writer.write_eof()
         status_line = await asyncio.wait_for(
             reader.readline(),
-            IO_TIMEOUT_SECONDS,
+            (
+                DELIVERY_RESPONSE_TIMEOUT_SECONDS + IO_TIMEOUT_SECONDS
+                if json.loads(body).get("action") == "reply"
+                else IO_TIMEOUT_SECONDS
+            ),
         )
         if status_line != b"HTTP/1.1 200 OK\r\n":
             raise RuntimeError("invalid IPC HTTP response")
@@ -689,7 +913,7 @@ async def _safe_close_writer(writer: asyncio.StreamWriter) -> None:
         writer.close()
         await asyncio.wait_for(writer.wait_closed(), IO_TIMEOUT_SECONDS)
     except asyncio.CancelledError:
-        return
+        raise
     except Exception:  # noqa: BLE001
         return
 
@@ -709,5 +933,10 @@ def _invalid(reason: str) -> dict[str, object]:
     return {"status": "invalid_request", "reason": reason}
 
 
-def _internal_error() -> dict[str, object]:
-    return {"status": "error", "reason": "internal_error"}
+def _delivery_unknown() -> dict[str, object]:
+    return {"status": "unknown", "reason": "delivery_unknown"}
+
+
+def _consume_task_exception(task: asyncio.Future[Any]) -> None:
+    if not task.cancelled():
+        task.exception()

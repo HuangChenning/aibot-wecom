@@ -50,10 +50,17 @@ class RelayService:
                     reason="expired",
                 )
 
-            result = await deliver_with_retry(
-                lambda: self._client.reply(route, markdown),
-                self._sleep,
-            )
+            try:
+                result = await deliver_with_retry(
+                    lambda: self._client.reply(route, markdown),
+                    self._sleep,
+                )
+            except asyncio.CancelledError:
+                self._context_store.mark_unknown(context)
+                raise
+            except Exception:  # noqa: BLE001
+                self._context_store.mark_unknown(context)
+                return DeliveryResult("unknown")
             if result.status == "delivered":
                 self._context_store.mark_delivered(context, self._now())
             elif result.status == "unknown":

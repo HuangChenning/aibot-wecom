@@ -182,3 +182,67 @@ def test_concurrent_final_replies_call_sdk_once():
         assert client.calls == 1
 
     asyncio.run(run())
+
+
+def test_sdk_exception_marks_context_unknown_and_is_not_sent_again():
+    async def run() -> None:
+        class RaisingClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def reply(
+                self,
+                route: object,
+                markdown: str,
+            ) -> DeliveryResult:
+                self.calls += 1
+                raise RuntimeError("sdk failure")
+
+        client = RaisingClient()
+        service = RelayService(client, ContextStore(60), now=lambda: 100.0)
+        context = await service.handle_text("event-1", "hello", object())
+
+        assert (await service.reply(context, "first")).status == "unknown"
+        assert (await service.reply(context, "second")).status == "unknown"
+        assert client.calls == 1
+
+    asyncio.run(run())
+
+
+def test_cancelled_sdk_send_marks_context_unknown_before_reraising():
+    async def run() -> None:
+        class BlockingClient:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.started = asyncio.Event()
+
+            async def reply(
+                self,
+                route: object,
+                markdown: str,
+            ) -> DeliveryResult:
+                self.calls += 1
+                if self.calls > 1:
+                    return DeliveryResult("delivered")
+                self.started.set()
+                await asyncio.Event().wait()
+                return DeliveryResult("delivered")
+
+        client = BlockingClient()
+        service = RelayService(client, ContextStore(60), now=lambda: 100.0)
+        context = await service.handle_text("event-1", "hello", object())
+        reply_task = asyncio.create_task(service.reply(context, "first"))
+        await client.started.wait()
+        reply_task.cancel()
+
+        try:
+            await reply_task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("CancelledError must be re-raised")
+
+        assert (await service.reply(context, "second")).status == "unknown"
+        assert client.calls == 1
+
+    asyncio.run(run())

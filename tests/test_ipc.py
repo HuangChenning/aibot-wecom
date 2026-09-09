@@ -1,5 +1,7 @@
 import asyncio
+import gc
 import hashlib
+import inspect
 import json
 import os
 import socket
@@ -10,6 +12,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from wecom_aibot import ipc
 from wecom_aibot.context_store import ContextStore
 from wecom_aibot.delivery import DeliveryResult
 from wecom_aibot.ipc import (
@@ -47,6 +50,8 @@ def endpoint_path(tmp_path):
     try:
         yield str(parent / "s")
     finally:
+        (parent / "s").unlink(missing_ok=True)
+        (parent / "s.token").unlink(missing_ok=True)
         parent.rmdir()
 
 
@@ -362,8 +367,8 @@ def test_deep_json_service_error_and_disconnect_do_not_leak(endpoint_path):
                 },
             )
             assert service_response == {
-                "status": "error",
-                "reason": "internal_error",
+                "status": "unknown",
+                "reason": "delivery_unknown",
             }
             assert "sdk-secret-text" not in json.dumps(service_response)
 
@@ -519,10 +524,6 @@ def test_http_loopback_server_and_client_end_to_end():
             b"POST /ipc HTTP/1.1\r\nContent-Type: text/plain\r\n"
             b"Content-Length: 2\r\n\r\n{}"
         ),
-        (
-            b"POST /ipc HTTP/1.1\r\nContent-Type: application/json\r\n"
-            b"Content-Length: 2\r\n\r\n{}extra"
-        ),
     ],
 )
 def test_http_rejects_ambiguous_or_invalid_requests(raw):
@@ -594,6 +595,7 @@ def test_windows_token_failure_is_closed_and_listener_is_exclusive(tmp_path):
             "local-token",
             windows=True,
             windows_writer=fail_closed,
+            windows_parent_inspector=lambda _parent: (False, True),
         )
     assert not Path(token_path).exists()
     assert _WINDOWS_TOKEN_SDDL == "D:P(A;;FA;;;OW)"
@@ -625,3 +627,217 @@ def test_windows_token_failure_is_closed_and_listener_is_exclusive(tmp_path):
     assert fake_socket.options == [
         (socket.SOL_SOCKET, -5, 1),
     ]
+
+
+def test_reply_waits_for_retry_delay_longer_than_transport_timeout(endpoint_path):
+    async def run() -> None:
+        class RetryClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def reply(
+                self,
+                route: object,
+                markdown: str,
+            ) -> DeliveryResult:
+                self.calls += 1
+                if self.calls == 1:
+                    return DeliveryResult("not_delivered", retryable=True)
+                return DeliveryResult("delivered")
+
+        client = RetryClient()
+        service = RelayService(client, ContextStore(60))
+        context = await service.handle_text("event-1", "hello", object())
+        server = IpcServer(service, "local-token")
+        await server.start(endpoint_path)
+        try:
+            response = await asyncio.wait_for(
+                request(
+                    server.endpoint,
+                    "local-token",
+                    {
+                        "action": "reply",
+                        "context": context,
+                        "kind": "final",
+                        "markdown": "done",
+                    },
+                ),
+                timeout=2,
+            )
+            assert response == {"status": "delivered"}
+            assert client.calls == 2
+        finally:
+            await server.close()
+
+    asyncio.run(run())
+
+
+def test_timeout_constants_and_python_310_exception_compatibility():
+    assert ipc.DELIVERY_RESPONSE_TIMEOUT_SECONDS == 120
+    assert ipc.SHUTDOWN_TIMEOUT_SECONDS == 5
+    source = inspect.getsource(ipc)
+    assert "except TimeoutError" not in source
+    assert "asyncio.TimeoutError" in source
+
+
+def test_close_task_exception_is_retrieved():
+    async def run() -> None:
+        server = IpcServer(
+            RelayService(FakeClient(), ContextStore(60)),
+            "local-token",
+        )
+        leaked: list[dict[str, object]] = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: leaked.append(context))
+
+        async def failing_close() -> None:
+            raise RuntimeError("close failure")
+
+        server.close = failing_close  # type: ignore[method-assign]
+        server._schedule_close()
+        await asyncio.sleep(0)
+        task = server._close_task
+        assert task is not None and task.done()
+        server._close_task = None
+        del task
+        gc.collect()
+        await asyncio.sleep(0)
+        assert leaked == []
+
+    asyncio.run(run())
+
+
+def test_handler_cancellation_is_reraised_after_writer_cleanup():
+    async def run() -> None:
+        class BlockingReader:
+            async def readline(self) -> bytes:
+                await asyncio.Event().wait()
+                return b""
+
+        class FakeWriter:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+            async def wait_closed(self) -> None:
+                pass
+
+        server = IpcServer(
+            RelayService(FakeClient(), ContextStore(60)),
+            "local-token",
+        )
+        writer = FakeWriter()
+        task = asyncio.create_task(
+            server._handle_unix_connection(BlockingReader(), writer)
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert writer.closed
+
+    asyncio.run(run())
+
+
+def test_http_keep_alive_client_gets_immediate_response_without_eof():
+    async def run() -> None:
+        server = await start_http_test_server()
+        parsed = urlsplit(server.endpoint)
+        body = json.dumps(
+            {"token": "local-token", "action": "status"}
+        ).encode()
+        reader, writer = await asyncio.open_connection(
+            parsed.hostname,
+            parsed.port,
+        )
+        try:
+            writer.write(
+                b"POST /ipc HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode()
+                + b"Connection: keep-alive\r\n\r\n"
+                + body
+            )
+            await writer.drain()
+            status_line = await asyncio.wait_for(reader.readline(), timeout=0.2)
+            assert status_line == b"HTTP/1.1 200 OK\r\n"
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            await server.close()
+
+    asyncio.run(run())
+
+
+def test_windows_token_parent_validation_is_fail_closed():
+    ipc._validate_windows_token_parent(
+        r"C:\private\relay.token",
+        inspector=lambda _parent: (False, True),
+    )
+    with pytest.raises(PermissionError, match="reparse"):
+        ipc._validate_windows_token_parent(
+            r"C:\reparse\relay.token",
+            inspector=lambda _parent: (True, True),
+        )
+    with pytest.raises(PermissionError, match="owner-only"):
+        ipc._validate_windows_token_parent(
+            r"C:\shared\relay.token",
+            inspector=lambda _parent: (False, False),
+        )
+
+
+def test_server_can_restart_after_stop(endpoint_path):
+    async def run() -> None:
+        server = await start_test_server(endpoint_path, token="local-token")
+        for attempt in range(2):
+            assert await request(
+                server.endpoint,
+                "local-token",
+                {"action": "stop"},
+            ) == {"status": "stopping"}
+            await asyncio.wait_for(server.wait_stopped(), timeout=1)
+            if attempt == 0:
+                await server.start(endpoint_path)
+        assert not Path(endpoint_path).exists()
+        assert not Path(f"{endpoint_path}.token").exists()
+
+    asyncio.run(run())
+
+
+def test_close_second_cancel_waits_for_handler_completion():
+    async def run() -> None:
+        started = asyncio.Event()
+
+        async def stubborn_handler() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.Event().wait()
+
+        server = IpcServer(
+            RelayService(FakeClient(), ContextStore(60)),
+            "local-token",
+        )
+        task = asyncio.create_task(stubborn_handler())
+        server._handlers.add(task)
+        task.add_done_callback(server._handler_done)
+        await started.wait()
+        with patch.object(ipc, "SHUTDOWN_TIMEOUT_SECONDS", 0.01):
+            await server.close()
+        assert task.done()
+        assert task.cancelled()
+        await server.wait_stopped()
+
+    asyncio.run(run())
+
+
+def test_illegal_delivery_status_fails_closed_to_unknown():
+    result = DeliveryResult("illegal")  # type: ignore[arg-type]
+    assert _delivery_response(result) == {
+        "status": "unknown",
+        "reason": "delivery_unknown",
+    }
