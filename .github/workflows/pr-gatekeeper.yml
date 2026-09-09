@@ -1,0 +1,122 @@
+name: PR Gatekeeper Verification
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+concurrency:
+  group: pr-gatekeeper-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  gatekeeper:
+    name: Gatekeeper Verification
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          persist-credentials: false
+
+      - name: Checkout trusted gatekeeper base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: gatekeeper
+          persist-credentials: false
+
+      - name: Execute project verification
+        shell: bash
+        run: |
+          evidence_dir="$RUNNER_TEMP/pr-gatekeeper"
+          mkdir -p "$evidence_dir"
+          set +e
+          if [[ ! -f pr/pyproject.toml || ! -f pr/uv.lock ]]; then
+            printf '%s\n' 'Missing pyproject.toml or uv.lock.' > "$evidence_dir/ruff.log"
+            printf '%s\n' 'Missing pyproject.toml or uv.lock.' > "$evidence_dir/pytest.log"
+            ruff_exit=125
+            pytest_exit=125
+          else
+            (
+              cd pr
+              uv sync --locked
+            ) > "$evidence_dir/sync.log" 2>&1
+            sync_exit=$?
+            if [[ "$sync_exit" -eq 0 ]]; then
+              (
+                cd pr
+                uv run ruff check .
+              ) > "$evidence_dir/ruff.log" 2>&1
+              ruff_exit=$?
+              (
+                cd pr
+                uv run pytest
+              ) > "$evidence_dir/pytest.log" 2>&1
+              pytest_exit=$?
+            else
+              ruff_exit=$sync_exit
+              pytest_exit=$sync_exit
+              cp "$evidence_dir/sync.log" "$evidence_dir/ruff.log"
+              cp "$evidence_dir/sync.log" "$evidence_dir/pytest.log"
+            fi
+          fi
+          printf '{"ruff":%s,"pytest":%s}\n' "$ruff_exit" "$pytest_exit" > "$evidence_dir/exit-codes.json"
+
+      - name: Gather PR context
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          evidence_dir="$RUNNER_TEMP/pr-gatekeeper"
+          mkdir -p "$evidence_dir"
+          set +e
+          gh pr view "$PR_NUMBER" --json title,body,url,baseRefName,headRefOid > "$evidence_dir/pr_meta.json"
+          gh pr diff "$PR_NUMBER" > "$evidence_dir/pr_diff.patch"
+          exit 0
+
+      - name: Run trusted gatekeeper
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INITIAL_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          MINIMAX_BASE_URL: ${{ vars.MINIMAX_BASE_URL }}
+          MINIMAX_MODEL: ${{ vars.MINIMAX_MODEL }}
+        run: python gatekeeper/.github/scripts/pr_gatekeeper.py
+
+      - name: Enforce branch gate
+        if: always()
+        shell: bash
+        run: |
+          verdict_file="$RUNNER_TEMP/pr-gatekeeper/verdict.json"
+          if [[ ! -f "$verdict_file" ]]; then
+            echo "Gatekeeper did not produce a verdict."
+            exit 1
+          fi
+          python - "$verdict_file" <<'PY'
+          import json
+          import sys
+
+          verdict = json.load(open(sys.argv[1], encoding="utf-8")).get("verdict")
+          if verdict != "MERGEABLE":
+              raise SystemExit(f"Gatekeeper verdict blocks merge: {verdict}")
+          PY

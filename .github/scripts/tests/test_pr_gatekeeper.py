@@ -210,3 +210,22 @@ class EntrypointTests(unittest.TestCase):
                 return b'{"choices":[{"message":{"content":"{\\"verdict\\":\\"MERGEABLE\\",\\"acceptance_criteria\\":[],\\"observations\\":[]}"}}]}'
 
         return Response()
+
+
+class WorkflowShapeTests(unittest.TestCase):
+    def test_workflow_never_exposes_minimax_key_to_pr_validation(self) -> None:
+        workflow = Path(".github/workflows/pr-gatekeeper.yml").read_text(
+            encoding="utf-8"
+        )
+        validation = workflow.split("Run trusted gatekeeper", 1)[0]
+
+        self.assertNotIn("MINIMAX_API_KEY", validation)
+        self.assertNotIn("pull_request_target", workflow)
+
+    def test_workflow_checks_out_trusted_base_script(self) -> None:
+        workflow = Path(".github/workflows/pr-gatekeeper.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("ref: ${{ github.event.pull_request.base.sha }}", workflow)
+        self.assertIn("path: gatekeeper", workflow)
