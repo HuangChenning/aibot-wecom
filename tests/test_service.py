@@ -98,12 +98,10 @@ def test_retryable_failure_eventually_delivers_and_marks_context():
     asyncio.run(run())
 
 
-def test_unknown_result_is_not_retried_or_marked_delivered():
+def test_unknown_result_is_terminal_and_sdk_is_not_called_again():
     async def run() -> None:
         route = object()
-        client = FakeClient(
-            [DeliveryResult("unknown"), DeliveryResult("not_delivered")]
-        )
+        client = FakeClient([DeliveryResult("unknown")])
         sleep = AsyncMock()
         service = RelayService(
             client,
@@ -114,9 +112,40 @@ def test_unknown_result_is_not_retried_or_marked_delivered():
         context = await service.handle_text("event-1", "hello", route)
 
         assert (await service.reply(context, "first")).status == "unknown"
-        assert (await service.reply(context, "second")).status == "not_delivered"
-        assert client.calls == [(route, "first"), (route, "second")]
+        assert (await service.reply(context, "second")).status == "unknown"
+        assert client.calls == [(route, "first")]
         sleep.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_delivery_confirmed_after_expiry_is_remembered():
+    async def run() -> None:
+        current_time = 100.0
+
+        class ExpiringClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def reply(
+                self, route: object, markdown: str
+            ) -> DeliveryResult:
+                nonlocal current_time
+                self.calls += 1
+                current_time = 160.0
+                return DeliveryResult("delivered")
+
+        client = ExpiringClient()
+        service = RelayService(
+            client,
+            ContextStore(60),
+            now=lambda: current_time,
+        )
+        context = await service.handle_text("event-1", "hello", object())
+
+        assert (await service.reply(context, "first")).status == "delivered"
+        assert (await service.reply(context, "second")).status == "delivered"
+        assert client.calls == 1
 
     asyncio.run(run())
 

@@ -26,6 +26,24 @@ def test_final_claim_is_idempotent_after_delivery():
     assert store.claim_final(token, 100.0).status == "delivered"
 
 
+def test_delivered_during_send_is_recorded_after_context_expires():
+    store = ContextStore(ttl_seconds=60)
+    token = store.issue("event-1", object(), 100.0)
+
+    store.mark_delivered(token, 160.0)
+
+    assert store.claim_final(token, 161.0).status == "delivered"
+
+
+def test_unknown_delivery_is_a_terminal_historical_result():
+    store = ContextStore(ttl_seconds=60)
+    token = store.issue("event-1", object(), 100.0)
+
+    store.mark_unknown(token)
+
+    assert store.claim_final(token, 161.0).status == "unknown"
+
+
 def test_missing_context_is_rejected():
     store = ContextStore(ttl_seconds=60)
     assert store.claim_final("unknown-token", 100.0).status == "missing"

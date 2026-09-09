@@ -4,8 +4,8 @@ import secrets
 from dataclasses import dataclass
 from typing import Literal
 
-ClaimStatus = Literal["ready", "delivered", "expired", "missing"]
-FinalState = Literal["pending", "delivered"]
+ClaimStatus = Literal["ready", "delivered", "unknown", "expired", "missing"]
+FinalState = Literal["pending", "delivered", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -45,10 +45,12 @@ class ContextStore:
         record = self._by_token.get(token)
         if record is None:
             return Claim(status="missing")
-        if now >= record.expires_at:
-            return Claim(status="expired")
         if record.final_state == "delivered":
             return Claim(status="delivered")
+        if record.final_state == "unknown":
+            return Claim(status="unknown")
+        if now >= record.expires_at:
+            return Claim(status="expired")
         return Claim(status="ready")
 
     def route_for_relay(self, token: str, now: float) -> object | None:
@@ -60,6 +62,13 @@ class ContextStore:
 
     def mark_delivered(self, token: str, now: float) -> None:
         record = self._by_token.get(token)
-        if record is None or now >= record.expires_at:
+        if record is None:
             return
         record.final_state = "delivered"
+
+    def mark_unknown(self, token: str) -> None:
+        """Record an unknown delivery result as a relay-internal terminal state."""
+        record = self._by_token.get(token)
+        if record is None:
+            return
+        record.final_state = "unknown"

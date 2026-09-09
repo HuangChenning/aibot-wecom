@@ -33,6 +33,8 @@ class RelayService:
             claim = self._context_store.claim_final(context, now)
             if claim.status == "delivered":
                 return DeliveryResult("delivered")
+            if claim.status == "unknown":
+                return DeliveryResult("unknown")
             if claim.status != "ready":
                 return DeliveryResult(
                     "not_delivered",
@@ -54,4 +56,6 @@ class RelayService:
             )
             if result.status == "delivered":
                 self._context_store.mark_delivered(context, self._now())
+            elif result.status == "unknown":
+                self._context_store.mark_unknown(context)
             return result
