@@ -76,6 +76,13 @@ class ModelVerdictTests(unittest.TestCase):
 
         self.assertEqual("MERGEABLE", verdict.name)
 
+    def test_empty_optional_model_configuration_uses_safe_defaults(self) -> None:
+        request = make_model_request("", "", "secret-value", "prompt")
+        payload = json.loads(request.data.decode("utf-8"))
+
+        self.assertEqual("https://api.minimax.chat/v1/chat/completions", request.full_url)
+        self.assertEqual("MiniMax-Text-01", payload["model"])
+
     def test_truncate_text_marks_omitted_characters(self) -> None:
         self.assertEqual("abc... [2 characters omitted]", truncate_text("abcde", 3))
 

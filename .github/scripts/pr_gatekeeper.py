@@ -76,6 +76,8 @@ def parse_model_verdict(body: str) -> ModelVerdict:
 def make_model_request(
     base_url: str, model: str, api_key: str, prompt: str
 ) -> Request:
+    base_url = base_url or "https://api.minimax.chat/v1"
+    model = model or "MiniMax-Text-01"
     payload = {
         "model": model,
         "messages": [
