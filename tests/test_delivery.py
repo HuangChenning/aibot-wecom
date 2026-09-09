@@ -9,6 +9,18 @@ from wecom_aibot.delivery import (
 )
 
 
+def test_first_delivered_result_stops_without_retry_or_sleep():
+    async def run() -> None:
+        send = AsyncMock(return_value=DeliveryResult("delivered"))
+        sleep = AsyncMock()
+        result = await deliver_with_retry(send, sleep)
+        assert result.status == "delivered"
+        send.assert_awaited_once()
+        sleep.assert_not_awaited()
+
+    asyncio.run(run())
+
+
 def test_retryable_failure_is_sent_three_times_total():
     async def run() -> None:
         attempts = 0
