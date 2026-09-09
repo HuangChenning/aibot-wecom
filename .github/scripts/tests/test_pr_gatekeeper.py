@@ -229,3 +229,11 @@ class WorkflowShapeTests(unittest.TestCase):
 
         self.assertIn("ref: ${{ github.event.pull_request.base.sha }}", workflow)
         self.assertIn("path: gatekeeper", workflow)
+
+
+class DocumentationTests(unittest.TestCase):
+    def test_readme_mentions_required_secret_and_branch_protection(self) -> None:
+        readme = Path("README.md").read_text(encoding="utf-8")
+
+        self.assertIn("MINIMAX_API_KEY", readme)
+        self.assertIn("Gatekeeper Verification", readme)
