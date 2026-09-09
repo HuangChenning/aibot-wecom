@@ -841,3 +841,82 @@ def test_illegal_delivery_status_fails_closed_to_unknown():
         "status": "unknown",
         "reason": "delivery_unknown",
     }
+
+
+async def start_silent_unix_server(endpoint: str):
+    handlers: set[asyncio.Task[None]] = set()
+
+    async def hold_connection(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        await reader.readline()
+        await asyncio.sleep(1)
+        writer.close()
+        await writer.wait_closed()
+
+    def accept(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        task = asyncio.create_task(hold_connection(reader, writer))
+        handlers.add(task)
+        task.add_done_callback(handlers.discard)
+
+    server = await asyncio.start_unix_server(accept, path=endpoint)
+    return server, handlers
+
+
+def test_reply_response_deadline_returns_unknown_instead_of_timeout(
+    endpoint_path,
+):
+    async def run() -> None:
+        server, handlers = await start_silent_unix_server(endpoint_path)
+        try:
+            with patch.object(
+                ipc,
+                "DELIVERY_RESPONSE_TIMEOUT_SECONDS",
+                0.01,
+            ):
+                response = await request(
+                    endpoint_path,
+                    "local-token",
+                    {
+                        "action": "reply",
+                        "context": "context",
+                        "kind": "final",
+                        "markdown": "done",
+                    },
+                )
+            assert response == {
+                "status": "unknown",
+                "reason": "delivery_unknown",
+            }
+        finally:
+            server.close()
+            await server.wait_closed()
+            for task in handlers:
+                task.cancel()
+            await asyncio.gather(*handlers, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_non_reply_response_deadline_is_not_delivery_unknown(endpoint_path):
+    async def run() -> None:
+        server, handlers = await start_silent_unix_server(endpoint_path)
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await request(
+                    endpoint_path,
+                    "local-token",
+                    {"action": "status"},
+                )
+        finally:
+            server.close()
+            await server.wait_closed()
+            for task in handlers:
+                task.cancel()
+            await asyncio.gather(*handlers, return_exceptions=True)
+
+    asyncio.run(run())

@@ -22,13 +22,14 @@ class RelayService:
         self._context_store = context_store
         self._now = now
         self._sleep = sleep
-        self._final_lock = asyncio.Lock()
+        self._final_locks: dict[str, asyncio.Lock] = {}
 
     async def handle_text(self, event_id: str, text: str, route: object) -> str:
         return self._context_store.issue(event_id, route, self._now())
 
     async def reply(self, context: str, markdown: str) -> DeliveryResult:
-        async with self._final_lock:
+        lock = self._final_locks.setdefault(context, asyncio.Lock())
+        async with lock:
             now = self._now()
             claim = self._context_store.claim_final(context, now)
             if claim.status == "delivered":

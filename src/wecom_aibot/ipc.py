@@ -846,10 +846,15 @@ async def request(
     try:
         writer.write(data)
         await asyncio.wait_for(writer.drain(), IO_TIMEOUT_SECONDS)
-        response_data = await asyncio.wait_for(
-            reader.readline(),
-            response_timeout,
-        )
+        try:
+            response_data = await asyncio.wait_for(
+                reader.readline(),
+                response_timeout,
+            )
+        except asyncio.TimeoutError:
+            if payload.get("action") == "reply":
+                return _delivery_unknown()
+            raise
     finally:
         await _safe_close_writer(writer)
     return _parse_response(response_data)
@@ -866,6 +871,7 @@ async def _http_request(endpoint: str, body: bytes) -> dict[str, object]:
         asyncio.open_connection("127.0.0.1", parsed.port),
         IO_TIMEOUT_SECONDS,
     )
+    is_reply = json.loads(body).get("action") == "reply"
     try:
         writer.write(
             b"POST /ipc HTTP/1.1\r\n"
@@ -876,33 +882,38 @@ async def _http_request(endpoint: str, body: bytes) -> dict[str, object]:
             + body
         )
         await asyncio.wait_for(writer.drain(), IO_TIMEOUT_SECONDS)
-        status_line = await asyncio.wait_for(
-            reader.readline(),
-            (
-                DELIVERY_RESPONSE_TIMEOUT_SECONDS + IO_TIMEOUT_SECONDS
-                if json.loads(body).get("action") == "reply"
-                else IO_TIMEOUT_SECONDS
-            ),
-        )
-        if status_line != b"HTTP/1.1 200 OK\r\n":
-            raise RuntimeError("invalid IPC HTTP response")
-        content_length: int | None = None
-        while True:
-            line = await asyncio.wait_for(
+        try:
+            status_line = await asyncio.wait_for(
                 reader.readline(),
+                (
+                    DELIVERY_RESPONSE_TIMEOUT_SECONDS + IO_TIMEOUT_SECONDS
+                    if is_reply
+                    else IO_TIMEOUT_SECONDS
+                ),
+            )
+            if status_line != b"HTTP/1.1 200 OK\r\n":
+                raise RuntimeError("invalid IPC HTTP response")
+            content_length: int | None = None
+            while True:
+                line = await asyncio.wait_for(
+                    reader.readline(),
+                    IO_TIMEOUT_SECONDS,
+                )
+                if line == b"\r\n":
+                    break
+                name, separator, value = line.partition(b":")
+                if separator and name.lower() == b"content-length":
+                    content_length = int(value.strip())
+            if content_length is None or content_length > MAX_REQUEST_BYTES:
+                raise RuntimeError("invalid IPC HTTP response")
+            response_data = await asyncio.wait_for(
+                reader.readexactly(content_length),
                 IO_TIMEOUT_SECONDS,
             )
-            if line == b"\r\n":
-                break
-            name, separator, value = line.partition(b":")
-            if separator and name.lower() == b"content-length":
-                content_length = int(value.strip())
-        if content_length is None or content_length > MAX_REQUEST_BYTES:
-            raise RuntimeError("invalid IPC HTTP response")
-        response_data = await asyncio.wait_for(
-            reader.readexactly(content_length),
-            IO_TIMEOUT_SECONDS,
-        )
+        except asyncio.TimeoutError:
+            if is_reply:
+                return _delivery_unknown()
+            raise
     finally:
         await _safe_close_writer(writer)
     return _parse_response(response_data)

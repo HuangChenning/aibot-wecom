@@ -246,3 +246,52 @@ def test_cancelled_sdk_send_marks_context_unknown_before_reraising():
         assert client.calls == 1
 
     asyncio.run(run())
+
+
+def test_different_contexts_can_send_concurrently():
+    async def run() -> None:
+        class PerRouteClient:
+            def __init__(self) -> None:
+                self.slow_started = asyncio.Event()
+                self.release_slow = asyncio.Event()
+                self.calls: list[str] = []
+
+            async def reply(
+                self,
+                route: object,
+                markdown: str,
+            ) -> DeliveryResult:
+                assert isinstance(route, str)
+                self.calls.append(route)
+                if route == "slow-route":
+                    self.slow_started.set()
+                    await self.release_slow.wait()
+                return DeliveryResult("delivered")
+
+        client = PerRouteClient()
+        service = RelayService(client, ContextStore(60), now=lambda: 100.0)
+        slow_context = await service.handle_text(
+            "slow-event",
+            "slow",
+            "slow-route",
+        )
+        fast_context = await service.handle_text(
+            "fast-event",
+            "fast",
+            "fast-route",
+        )
+
+        slow_reply = asyncio.create_task(service.reply(slow_context, "slow"))
+        await client.slow_started.wait()
+        try:
+            fast_result = await asyncio.wait_for(
+                service.reply(fast_context, "fast"),
+                timeout=0.1,
+            )
+            assert fast_result.status == "delivered"
+            assert client.calls == ["slow-route", "fast-route"]
+        finally:
+            client.release_slow.set()
+            await slow_reply
+
+    asyncio.run(run())
