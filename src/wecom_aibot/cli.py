@@ -33,7 +33,7 @@ from packaging.version import InvalidVersion, Version
 from wecom_aibot import __version__, ipc
 from wecom_aibot.context_store import ContextStore
 from wecom_aibot.ipc import IpcServer, request
-from wecom_aibot.sdk import TextEvent, create_sdk_client
+from wecom_aibot.sdk import SdkConnectError, TextEvent, create_sdk_client
 from wecom_aibot.service import RelayService
 
 EXIT_OK = 0
@@ -499,7 +499,7 @@ async def serve_relay(
     *,
     ready: asyncio.Event | None = None,
 ) -> int:
-    adapter = create_sdk_client(bot_id, secret)
+    adapter = create_sdk_client(bot_id, secret, on_notice=_emit)
     service = RelayService(adapter, ContextStore(context_ttl))
     dispatcher = HandlerDispatcher(service, handler_argv)
     adapter.on_text(dispatcher.dispatch)
@@ -521,7 +521,10 @@ async def serve_relay(
             raise CliError("stale_endpoint") from error
         endpoint_written = True
         with _stop_signals(server):
-            connected = await _connect_until_stopped(adapter, server)
+            try:
+                connected = await _connect_until_stopped(adapter, server)
+            except SdkConnectError as error:
+                raise CliError(error.code) from error
             if connected:
                 _emit({"event": "serving"})
                 if ready is not None:

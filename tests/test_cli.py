@@ -347,7 +347,7 @@ def test_blank_environment_credentials_are_rejected(monkeypatch):
     assert error.value.code == "missing_credentials"
 
 
-def _unreachable_factory(bot_id: str, secret: str) -> object:
+def _unreachable_factory(bot_id: str, secret: str, **_kwargs: object) -> object:
     raise AssertionError("SDK client must not be created")
 
 
@@ -415,7 +415,7 @@ def test_serve_reports_status_and_stops_on_request(
     capsys,
 ):
     adapter = FakeAdapter()
-    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret: adapter)
+    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret, **_kwargs: adapter)
     runtime_dir = short_runtime_dir
     base = runtime_dir / "relay.sock"
 
@@ -454,7 +454,7 @@ def test_served_relay_delivers_reply_for_dispatched_event(
     monkeypatch,
 ):
     adapter = FakeAdapter()
-    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret: adapter)
+    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret, **_kwargs: adapter)
     runtime_dir = short_runtime_dir
     base = runtime_dir / "relay.sock"
     handler_output = tmp_path / "handler.jsonl"
@@ -1307,7 +1307,7 @@ def test_leftover_socket_with_token_is_already_running(
     monkeypatch,
     capsys,
 ):
-    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret: FakeAdapter())
+    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret, **_kwargs: FakeAdapter())
     base = short_runtime_dir / "relay.sock"
     base.write_bytes(b"stale-socket")
     token = Path(f"{base}.token")
@@ -1325,7 +1325,7 @@ def test_leftover_socket_with_token_is_already_running(
 
 @pytest.mark.skipif(os.name == "nt", reason="unix leftover socket")
 def test_leftover_socket_without_token_is_stale_endpoint(short_runtime_dir, monkeypatch):
-    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret: FakeAdapter())
+    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret, **_kwargs: FakeAdapter())
     base = short_runtime_dir / "relay.sock"
     base.write_bytes(b"stale-socket")
 
@@ -1339,7 +1339,7 @@ def test_leftover_socket_without_token_is_stale_endpoint(short_runtime_dir, monk
 
 @pytest.mark.skipif(os.name == "nt", reason="unix leftover endpoint")
 def test_leftover_endpoint_file_is_stale_and_not_deleted(short_runtime_dir, monkeypatch):
-    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret: FakeAdapter())
+    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret, **_kwargs: FakeAdapter())
     base = short_runtime_dir / "relay.sock"
     leftover = Path(f"{base}.endpoint")
     leftover.write_text("unix:/old", encoding="utf-8")
@@ -1356,7 +1356,7 @@ def test_leftover_endpoint_file_is_stale_and_not_deleted(short_runtime_dir, monk
 @pytest.mark.skipif(os.name == "nt", reason="unix signals")
 def test_sigterm_requests_controlled_stop(short_runtime_dir, monkeypatch):
     adapter = FakeAdapter()
-    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret: adapter)
+    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret, **_kwargs: adapter)
     runtime_dir = short_runtime_dir
     base = runtime_dir / "relay.sock"
 
@@ -1403,7 +1403,7 @@ def test_signal_during_hanging_connect_exits_without_waiting(
     signum: int,
 ):
     adapter = HangingConnectAdapter()
-    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret: adapter)
+    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret, **_kwargs: adapter)
     runtime_dir = short_runtime_dir
     base = runtime_dir / "relay.sock"
 
@@ -1453,7 +1453,7 @@ def test_reply_succeeds_during_handler_drain_after_stop(
     monkeypatch,
 ):
     adapter = FakeAdapter()
-    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret: adapter)
+    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret, **_kwargs: adapter)
     runtime_dir = short_runtime_dir
     base = runtime_dir / "relay.sock"
     handler_output = tmp_path / "handler.jsonl"

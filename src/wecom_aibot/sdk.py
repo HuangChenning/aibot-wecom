@@ -13,8 +13,17 @@ from wecom_aibot.delivery import DeliveryResult
 
 REPLY_TIMEOUT_SECONDS = 15.0
 ACQUIRE_TIMEOUT_SECONDS = 10.0
+AUTH_TIMEOUT_SECONDS = 15.0
 DEFAULT_MAX_CONCURRENT_REPLIES = 1
 STREAM_ID_PREFIX = "stream"
+
+
+class SdkConnectError(Exception):
+    """Raised when the official SDK socket is up but subscribe never succeeds."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 # The installed SDK reports platform outcomes only through exception messages
 # raised by aibot.ws.WsConnectionManager, so they are matched exactly here.
@@ -87,6 +96,47 @@ class _SilentLogger:
         return
 
 
+def _content_from_text_field(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    content = value.get("content")
+    if isinstance(content, str) and content:
+        return content
+    return None
+
+
+def _text_from_body(body: dict[str, Any]) -> str | None:
+    """Pull user-visible text from text, mixed, or voice callbacks."""
+    direct = _content_from_text_field(body.get("text"))
+    if direct is not None:
+        return direct
+
+    voice = body.get("voice")
+    if isinstance(voice, dict):
+        transcript = _content_from_text_field(voice) or (
+            voice.get("content") if isinstance(voice.get("content"), str) else None
+        )
+        if isinstance(transcript, str) and transcript:
+            return transcript
+
+    mixed = body.get("mixed")
+    if not isinstance(mixed, dict):
+        return None
+    items = mixed.get("msg_item")
+    if not isinstance(items, list):
+        return None
+    parts: list[str] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("msgtype") != "text":
+            continue
+        piece = _content_from_text_field(item.get("text"))
+        if piece is not None:
+            parts.append(piece)
+    if not parts:
+        return None
+    return "\n".join(parts)
+
+
 def parse_text_event(
     frame: object,
     *,
@@ -104,9 +154,8 @@ def parse_text_event(
     if not isinstance(req_id, str) or not req_id:
         return None
 
-    text_field = body.get("text")
-    text = text_field.get("content") if isinstance(text_field, dict) else None
-    if not isinstance(text, str) or not text:
+    text = _text_from_body(body)
+    if text is None:
         return None
 
     msgid = body.get("msgid")
@@ -119,6 +168,55 @@ def parse_text_event(
             stream_id=stream_id_factory(STREAM_ID_PREFIX),
         ),
     )
+
+
+def describe_inbound_frame(frame: object) -> dict[str, object]:
+    """Describe a callback frame without copying secrets or message text."""
+    if not isinstance(frame, dict):
+        return {
+            "event": "inbound_frame",
+            "cmd": "",
+            "msgtype": "",
+            "eventtype": "",
+            "parsed": False,
+            "reason": "non_object",
+            "body_keys": [],
+        }
+
+    body = frame.get("body")
+    headers = frame.get("headers")
+    cmd = frame.get("cmd")
+    msgtype = body.get("msgtype") if isinstance(body, dict) else None
+    eventtype = None
+    if isinstance(body, dict):
+        nested = body.get("event")
+        if isinstance(nested, dict):
+            eventtype = nested.get("eventtype")
+
+    parsed = parse_text_event(frame) is not None
+    reason = ""
+    if not parsed:
+        if not isinstance(headers, dict) or not isinstance(headers.get("req_id"), str) or not headers.get("req_id"):
+            reason = "missing_req_id"
+        elif not isinstance(body, dict):
+            reason = "missing_body"
+        else:
+            reason = "unusable_text"
+
+    body_keys = (
+        sorted(key for key in body if isinstance(key, str))[:20]
+        if isinstance(body, dict)
+        else []
+    )
+    return {
+        "event": "inbound_frame",
+        "cmd": cmd if isinstance(cmd, str) else "",
+        "msgtype": msgtype if isinstance(msgtype, str) else "",
+        "eventtype": eventtype if isinstance(eventtype, str) else "",
+        "parsed": parsed,
+        "reason": reason,
+        "body_keys": body_keys,
+    }
 
 
 def classify_reply_failure(error: BaseException) -> DeliveryResult | None:
@@ -160,12 +258,16 @@ class WeComSdkAdapter:
         max_concurrent_replies: int = DEFAULT_MAX_CONCURRENT_REPLIES,
         reply_timeout: float = REPLY_TIMEOUT_SECONDS,
         acquire_timeout: float = ACQUIRE_TIMEOUT_SECONDS,
+        auth_timeout: float = AUTH_TIMEOUT_SECONDS,
+        on_notice: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         if max_concurrent_replies < 1:
             raise ValueError("max_concurrent_replies must be at least 1")
         self._client = client
         self._reply_timeout = reply_timeout
         self._acquire_timeout = acquire_timeout
+        self._auth_timeout = auth_timeout
+        self._on_notice = on_notice
         self._permits = asyncio.Semaphore(max_concurrent_replies)
         self._inbound_enabled = True
 
@@ -207,8 +309,28 @@ class WeComSdkAdapter:
             self._permits.release()
         return DeliveryResult("delivered")
 
+    def _notice(self, event: dict[str, object]) -> None:
+        if self._on_notice is not None:
+            self._on_notice(event)
+
     def on_text(self, callback: Callable[[TextEvent], None]) -> None:
         client = self._client
+        manager = getattr(client, "_ws_manager", None)
+        previous = getattr(manager, "on_message", None) if manager is not None else None
+
+        def report_and_forward(frame: dict[str, Any]) -> None:
+            meta = describe_inbound_frame(frame)
+            self._notice(meta)
+            # A newer subscribe won this Bot. Reconnecting would immediately
+            # kick that winner and loop; the official SDK does not stop itself.
+            if meta.get("eventtype") == "disconnected_event" and manager is not None:
+                manager._is_manual_close = True
+                self._notice({"event": "sdk_replaced"})
+            if previous is not None:
+                previous(frame)
+
+        if manager is not None:
+            manager.on_message = report_and_forward
 
         def handle(frame: dict[str, Any]) -> None:
             if not self._inbound_enabled:
@@ -217,20 +339,66 @@ class WeComSdkAdapter:
             if event is not None:
                 callback(event)
 
-        client.on("message.text", handle)  # type: ignore[attr-defined]
+        # Official SDK emits `message` for every callback, then a more specific
+        # `message.text` / `message.mixed` / `message.voice`. Subscribe to the
+        # generic event so mixed/voice text is not dropped.
+        client.on("message", handle)  # type: ignore[attr-defined]
 
     def stop_inbound(self) -> None:
         """Drop further inbound events while in-flight replies stay allowed."""
         self._inbound_enabled = False
 
     async def connect(self) -> None:
-        await self._client.connect()  # type: ignore[attr-defined]
+        """Open the SDK socket and wait until subscribe/auth actually succeeds."""
+        client = self._client
+        loop = asyncio.get_running_loop()
+        finished: asyncio.Future[None] = loop.create_future()
+
+        def on_authenticated() -> None:
+            if not finished.done():
+                finished.set_result(None)
+
+        def on_error(_error: object) -> None:
+            if not finished.done():
+                finished.set_exception(SdkConnectError("sdk_auth_failed"))
+
+        client.on("authenticated", on_authenticated)  # type: ignore[attr-defined]
+        client.on("error", on_error)  # type: ignore[attr-defined]
+
+        def on_disconnected(reason: object) -> None:
+            self._notice(
+                {
+                    "event": "sdk_disconnected",
+                    "reason_len": len(str(reason)),
+                }
+            )
+
+        def on_reconnecting(attempt: object) -> None:
+            self._notice(
+                {
+                    "event": "sdk_reconnecting",
+                    "attempt": attempt if isinstance(attempt, int) else 0,
+                }
+            )
+
+        client.on("disconnected", on_disconnected)  # type: ignore[attr-defined]
+        client.on("reconnecting", on_reconnecting)  # type: ignore[attr-defined]
+        await client.connect()  # type: ignore[attr-defined]
+        try:
+            await asyncio.wait_for(asyncio.shield(finished), self._auth_timeout)
+        except asyncio.TimeoutError as error:
+            raise SdkConnectError("sdk_auth_timeout") from error
 
     def disconnect(self) -> None:
         self._client.disconnect()  # type: ignore[attr-defined]
 
 
-def create_sdk_client(bot_id: str, secret: str) -> WeComSdkAdapter:
+def create_sdk_client(
+    bot_id: str,
+    secret: str,
+    *,
+    on_notice: Callable[[dict[str, object]], None] | None = None,
+) -> WeComSdkAdapter:
     """Build the adapter over a real WebSocket client for the given credentials."""
     return WeComSdkAdapter(
         WSClient(
@@ -239,5 +407,6 @@ def create_sdk_client(bot_id: str, secret: str) -> WeComSdkAdapter:
                 secret=secret,
                 logger=_SilentLogger(),
             )
-        )
+        ),
+        on_notice=on_notice,
     )

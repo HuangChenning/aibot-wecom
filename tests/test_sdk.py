@@ -1,4 +1,5 @@
 import asyncio
+import json
 from typing import Any
 
 import pytest
@@ -10,6 +11,7 @@ from wecom_aibot.sdk import (
     REPLY_TIMEOUT_SECONDS,
     ReplyRoute,
     WeComSdkAdapter,
+    describe_inbound_frame,
     parse_text_event,
 )
 
@@ -274,3 +276,245 @@ def test_text_frame_without_msgid_falls_back_to_req_id():
 )
 def test_unusable_frames_are_ignored(frame: dict[str, Any]):
     assert parse_text_event(frame, stream_id_factory=lambda prefix: prefix) is None
+
+
+def test_mixed_frame_text_items_are_parsed():
+    frame = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-1"},
+        "body": {
+            "msgid": "msg-mixed",
+            "msgtype": "mixed",
+            "mixed": {
+                "msg_item": [
+                    {"msgtype": "text", "text": {"content": "hello mixed"}},
+                    {"msgtype": "image", "image": {"url": "https://example.invalid/x"}},
+                ]
+            },
+        },
+    }
+
+    event = parse_text_event(frame, stream_id_factory=lambda prefix: f"{prefix}-1")
+
+    assert event is not None
+    assert event.event_id == "msg-mixed"
+    assert event.text == "hello mixed"
+    assert event.route.req_id == "req-1"
+
+
+def test_voice_transcript_is_parsed():
+    frame = {
+        "headers": {"req_id": "req-1"},
+        "body": {
+            "msgid": "msg-voice",
+            "msgtype": "voice",
+            "voice": {"content": "hello voice"},
+        },
+    }
+
+    event = parse_text_event(frame, stream_id_factory=lambda prefix: prefix)
+
+    assert event is not None
+    assert event.text == "hello voice"
+
+
+class _FakeWsClient:
+    """Mimics the official SDK client's event emitter used for connect/inbound."""
+
+    def __init__(self) -> None:
+        self._listeners: dict[str, list] = {}
+        self.connected = False
+
+    def on(self, event: str, callback: Any) -> None:
+        self._listeners.setdefault(event, []).append(callback)
+
+    def emit(self, event: str, *args: Any) -> None:
+        for callback in list(self._listeners.get(event, [])):
+            callback(*args)
+
+    async def connect(self) -> None:
+        self.connected = True
+
+    def disconnect(self) -> None:
+        return
+
+    async def reply_stream(
+        self,
+        frame: dict[str, Any],
+        stream_id: str,
+        content: str,
+        finish: bool = False,
+    ) -> dict[str, Any]:
+        return {"errcode": 0}
+
+
+def test_connect_does_not_return_before_authenticated():
+    async def run() -> None:
+        client = _FakeWsClient()
+        adapter = WeComSdkAdapter(client, auth_timeout=0.2)
+
+        async def authenticate_later() -> None:
+            await asyncio.sleep(0.02)
+            client.emit("authenticated")
+
+        task = asyncio.create_task(authenticate_later())
+        await adapter.connect()
+        await task
+        assert client.connected is True
+
+    asyncio.run(run())
+
+
+def test_connect_fails_when_authentication_errors():
+    async def run() -> None:
+        client = _FakeWsClient()
+        adapter = WeComSdkAdapter(client, auth_timeout=0.2)
+
+        async def fail_later() -> None:
+            await asyncio.sleep(0.01)
+            client.emit("error", RuntimeError("Authentication failed: denied (code: 40001)"))
+
+        task = asyncio.create_task(fail_later())
+        with pytest.raises(Exception, match="sdk_auth_failed"):
+            await adapter.connect()
+        await task
+
+    asyncio.run(run())
+
+
+def test_connect_fails_when_authentication_times_out():
+    async def run() -> None:
+        adapter = WeComSdkAdapter(_FakeWsClient(), auth_timeout=0.02)
+        with pytest.raises(Exception, match="sdk_auth_timeout"):
+            await adapter.connect()
+
+    asyncio.run(run())
+
+
+def test_on_text_dispatches_generic_message_frames_not_only_message_text():
+    received: list[str] = []
+    client = _FakeWsClient()
+    adapter = WeComSdkAdapter(client)
+    adapter.on_text(lambda event: received.append(event.text))
+
+    client.emit(
+        "message",
+        {
+            "headers": {"req_id": "req-1"},
+            "body": {
+                "msgid": "msg-1",
+                "msgtype": "mixed",
+                "mixed": {
+                    "msg_item": [{"msgtype": "text", "text": {"content": "via mixed"}}]
+                },
+            },
+        },
+    )
+
+    assert received == ["via mixed"]
+
+
+def test_describe_inbound_frame_marks_text_as_parsed():
+    meta = describe_inbound_frame(
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-1"},
+            "body": {
+                "msgid": "msg-1",
+                "msgtype": "text",
+                "text": {"content": "hello"},
+                "from": {"userid": "user-1"},
+            },
+        }
+    )
+
+    assert meta["parsed"] is True
+    assert meta["cmd"] == "aibot_msg_callback"
+    assert meta["msgtype"] == "text"
+    assert "hello" not in json.dumps(meta)
+    assert "user-1" not in json.dumps(meta)
+    assert "req-1" not in json.dumps(meta)
+
+
+def test_describe_inbound_frame_reports_unusable_image_without_payload():
+    meta = describe_inbound_frame(
+        {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-secret"},
+            "body": {"msgtype": "image", "image": {"url": "https://example.invalid/x"}},
+        }
+    )
+
+    assert meta["parsed"] is False
+    assert meta["msgtype"] == "image"
+    assert meta["reason"] == "unusable_text"
+    assert "req-secret" not in json.dumps(meta)
+
+
+def test_ws_manager_frames_are_reported_even_when_unparsed():
+    notices: list[dict[str, object]] = []
+
+    class _Manager:
+        def __init__(self) -> None:
+            self.on_message = lambda frame: seen.append(frame)
+
+    class _Client(_FakeWsClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self._ws_manager = _Manager()
+
+    seen: list[object] = []
+    client = _Client()
+    adapter = WeComSdkAdapter(client, on_notice=notices.append)
+    adapter.on_text(lambda event: None)
+    frame = {
+        "cmd": "aibot_event_callback",
+        "headers": {"req_id": "req-1"},
+        "body": {"msgtype": "event", "event": {"eventtype": "enter_chat"}},
+    }
+
+    client._ws_manager.on_message(frame)
+
+    assert seen == [frame]
+    assert notices == [
+        {
+            "event": "inbound_frame",
+            "cmd": "aibot_event_callback",
+            "msgtype": "event",
+            "eventtype": "enter_chat",
+            "parsed": False,
+            "reason": "unusable_text",
+            "body_keys": ["event", "msgtype"],
+        }
+    ]
+
+
+def test_disconnected_event_suppresses_sdk_reconnect():
+    notices: list[dict[str, object]] = []
+
+    class _Manager:
+        def __init__(self) -> None:
+            self.on_message = lambda frame: None
+            self._is_manual_close = False
+
+    class _Client(_FakeWsClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self._ws_manager = _Manager()
+
+    client = _Client()
+    adapter = WeComSdkAdapter(client, on_notice=notices.append)
+    adapter.on_text(lambda event: None)
+    frame = {
+        "cmd": "aibot_event_callback",
+        "headers": {"req_id": "req-1"},
+        "body": {
+            "msgtype": "event",
+            "event": {"eventtype": "disconnected_event"},
+        },
+    }
+
+    client._ws_manager.on_message(frame)
+
+    assert client._ws_manager._is_manual_close is True
+    assert any(item.get("event") == "sdk_replaced" for item in notices)
