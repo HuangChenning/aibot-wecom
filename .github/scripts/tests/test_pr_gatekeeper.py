@@ -237,6 +237,17 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertIn("ref: ${{ github.event.pull_request.base.sha }}", workflow)
         self.assertIn("path: gatekeeper", workflow)
 
+    def test_workflow_sets_gh_repo_when_workspace_is_not_a_git_root(self) -> None:
+        workflow = Path(".github/workflows/pr-gatekeeper.yml").read_text(
+            encoding="utf-8"
+        )
+        gather, _, remainder = workflow.partition("Gather PR context")
+        trusted, _, _ = remainder.partition("Enforce branch gate")
+
+        self.assertNotIn("GH_REPO:", gather)
+        self.assertIn("GH_REPO: ${{ github.repository }}", trusted)
+        self.assertGreaterEqual(trusted.count("GH_REPO: ${{ github.repository }}"), 2)
+
 
 class DocumentationTests(unittest.TestCase):
     def test_readme_mentions_required_secret_and_branch_protection(self) -> None:
