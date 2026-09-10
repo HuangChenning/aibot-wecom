@@ -22,7 +22,10 @@ _ACK_ERROR_PATTERN = re.compile(r"\AReply ack error: errcode=(-?\d+)")
 _QUEUE_FULL_PATTERN = re.compile(r"\AReply queue for reqId .+ exceeds max size")
 _NOT_CONNECTED_MESSAGE = "WebSocket not connected, unable to send data"
 
-_RETRYABLE_ERRCODES = frozenset({-1, 45009})
+# Only codes with documented rate-limit semantics are retried. Everything else,
+# including the platform's generic "system busy" -1, stays non-retryable until
+# real platform evidence justifies otherwise.
+_RETRYABLE_ERRCODES = frozenset({45009})
 _ERRCODE_REASONS = {
     40001: "auth_rejected",
     40014: "auth_rejected",
@@ -164,6 +167,7 @@ class WeComSdkAdapter:
         self._reply_timeout = reply_timeout
         self._acquire_timeout = acquire_timeout
         self._permits = asyncio.Semaphore(max_concurrent_replies)
+        self._inbound_enabled = True
 
     async def reply(self, route: object, markdown: str) -> DeliveryResult:
         if not isinstance(route, ReplyRoute):
@@ -207,11 +211,17 @@ class WeComSdkAdapter:
         client = self._client
 
         def handle(frame: dict[str, Any]) -> None:
+            if not self._inbound_enabled:
+                return
             event = parse_text_event(frame)
             if event is not None:
                 callback(event)
 
         client.on("message.text", handle)  # type: ignore[attr-defined]
+
+    def stop_inbound(self) -> None:
+        """Drop further inbound events while in-flight replies stay allowed."""
+        self._inbound_enabled = False
 
     async def connect(self) -> None:
         await self._client.connect()  # type: ignore[attr-defined]

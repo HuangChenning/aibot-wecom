@@ -429,11 +429,19 @@ def _create_loopback_listener() -> socket.socket:
 
 
 class IpcServer:
-    def __init__(self, service: RelayService, token: str) -> None:
+    def __init__(
+        self,
+        service: RelayService,
+        token: str,
+        *,
+        defer_close_on_stop: bool = False,
+    ) -> None:
         if not token:
             raise ValueError("token must not be empty")
         self._service = service
         self._token = token
+        self._defer_close_on_stop = defer_close_on_stop
+        self._stop_requested = asyncio.Event()
         self._server: asyncio.AbstractServer | None = None
         self._socket_path: str | None = None
         self._token_path: str | None = None
@@ -456,6 +464,7 @@ class IpcServer:
         self._stop_handler = None
         listener: socket.socket | None = None
         self._closed.clear()
+        self._stop_requested.clear()
         token_path = f"{endpoint_path}.token"
         try:
             if os.name == "nt":
@@ -588,10 +597,18 @@ class IpcServer:
                             )
             finally:
                 self._remove_local_files()
+                self._stop_requested.set()
                 self._closed.set()
 
     async def wait_stopped(self) -> None:
         await self._closed.wait()
+
+    def request_stop(self) -> None:
+        """Signal a controlled shutdown without closing the endpoint yet."""
+        self._stop_requested.set()
+
+    async def wait_stop_requested(self) -> None:
+        await self._stop_requested.wait()
 
     def _remove_local_files(self) -> None:
         for path in (self._socket_path, self._token_path):
@@ -692,6 +709,9 @@ class IpcServer:
         finally:
             await _safe_close_writer(writer)
         if should_stop:
+            if self._defer_close_on_stop:
+                self._stop_requested.set()
+                return
             self._stop_handler = asyncio.current_task()
             self._schedule_close()
 
@@ -734,6 +754,9 @@ class IpcServer:
         finally:
             await _safe_close_writer(writer)
         if should_stop:
+            if self._defer_close_on_stop:
+                self._stop_requested.set()
+                return
             self._stop_handler = asyncio.current_task()
             self._schedule_close()
 

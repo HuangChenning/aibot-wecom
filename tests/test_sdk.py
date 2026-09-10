@@ -100,6 +100,20 @@ def test_platform_rate_limit_is_not_delivered_but_retryable():
     asyncio.run(run())
 
 
+def test_platform_generic_minus_one_is_not_retryable():
+    async def run() -> None:
+        error = RuntimeError("Reply ack error: errcode=-1, errmsg=system busy")
+        adapter = WeComSdkAdapter(FakeSdkClient([error]))
+
+        result = await adapter.reply(_route(), "answer")
+
+        assert result.status == "not_delivered"
+        assert result.retryable is False
+        assert result.reason == "platform_rejected"
+
+    asyncio.run(run())
+
+
 def test_disconnected_send_is_reported_as_definitely_not_delivered():
     async def run() -> None:
         error = RuntimeError("WebSocket not connected, unable to send data")

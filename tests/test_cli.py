@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -386,6 +387,7 @@ class FakeAdapter:
     def __init__(self) -> None:
         self.connected = False
         self.disconnected = False
+        self.inbound_stopped = False
         self.callback = None
         self.replies: list[tuple[object, str]] = []
 
@@ -394,6 +396,9 @@ class FakeAdapter:
 
     async def connect(self) -> None:
         self.connected = True
+
+    def stop_inbound(self) -> None:
+        self.inbound_stopped = True
 
     def disconnect(self) -> None:
         self.disconnected = True
@@ -623,8 +628,76 @@ def _interactive(monkeypatch, *, tty: bool = True) -> None:
     monkeypatch.setattr(cli.sys, "stdout", FakeStream(cli.sys.stdout, tty))
 
 
-def _completed(returncode: int) -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess(args=list(cli.UPGRADE_COMMAND), returncode=returncode)
+def _write_executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path.resolve()
+
+
+def _verify_document(
+    *,
+    version: str = "1.1.0",
+    verified: int = 3,
+    skipped: int = 0,
+    failures: list | None = None,
+    error: str | None = None,
+) -> str:
+    document: dict[str, object] = {
+        "schema": cli.VERIFY_SCHEMA,
+        "version": cli.VERIFY_PROTOCOL_VERSION,
+    }
+    if error is not None:
+        document["error"] = error
+        return json.dumps(document)
+    document.update(
+        {
+            "installedVersion": version,
+            "verified": verified,
+            "skipped": skipped,
+            "failures": failures or [],
+        }
+    )
+    return json.dumps(document)
+
+
+def _stub_upgrade_environment(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    latest: str = "1.1.0",
+    current: str = "1.0.0",
+    verify_stdout: str | None = None,
+    upgrade_returncode: int = 0,
+    list_output: str = "wecom-aibot 1.0.0\n",
+    bin_dir: Path | None = None,
+):
+    uv = _write_executable(tmp_path / "uv-bin" / "uv")
+    tools_bin = bin_dir or (tmp_path / "tools" / "bin")
+    tools_bin.mkdir(parents=True, exist_ok=True)
+    target = _write_executable(tools_bin / "wecom-aibot")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: str(uv) if name == "uv" else None)
+    monkeypatch.setattr(cli, "installed_version", lambda: current)
+    monkeypatch.setattr(cli, "fetch_latest_version", lambda: latest)
+    if verify_stdout is None:
+        verify_stdout = _verify_document(version=latest)
+    invocations: list[tuple[tuple[str, ...], dict]] = []
+
+    def fake_run(args, **kwargs):
+        argv = tuple(str(item) for item in args)
+        invocations.append((argv, kwargs))
+        if argv[:1] == (str(uv),) and argv[1:] == cli.UV_TOOL_LIST_ARGUMENTS:
+            return subprocess.CompletedProcess(args, 0, stdout=list_output)
+        if argv[:1] == (str(uv),) and argv[1:] == cli.UV_TOOL_BIN_ARGUMENTS:
+            return subprocess.CompletedProcess(args, 0, stdout=f"{tools_bin}\n")
+        if argv[:1] == (str(uv),) and argv[1:] == cli.UPGRADE_ARGUMENTS:
+            return subprocess.CompletedProcess(args, upgrade_returncode)
+        if argv == (str(target), cli.VERIFY_INSTALL_COMMAND):
+            return subprocess.CompletedProcess(args, 0, stdout=verify_stdout)
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    return invocations, uv, target
 
 
 def test_upgrade_reports_up_to_date_without_running_any_command(monkeypatch, capsys):
@@ -645,29 +718,24 @@ def test_upgrade_uses_pep440_ordering_for_prereleases(monkeypatch, capsys):
     assert "already_up_to_date" in capsys.readouterr().out
 
 
-def test_upgrade_asks_for_confirmation_then_runs_fixed_command(monkeypatch, capsys):
-    monkeypatch.setattr(cli, "installed_version", lambda: "1.0.0")
-    monkeypatch.setattr(cli, "fetch_latest_version", lambda: "1.1.0")
-    monkeypatch.setattr(
-        cli,
-        "verify_installed_distribution",
-        lambda: cli.IntegrityReport(verified=12, skipped=1, failures=()),
-    )
+def test_upgrade_asks_for_confirmation_then_runs_fixed_command(tmp_path, monkeypatch, capsys):
+    invocations, uv, target = _stub_upgrade_environment(tmp_path, monkeypatch)
     _interactive(monkeypatch)
     monkeypatch.setattr("builtins.input", lambda prompt="": "y")
-    invocations: list[tuple[tuple, dict]] = []
-
-    def fake_run(args, **kwargs):
-        invocations.append((tuple(args), kwargs))
-        return _completed(0)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
     assert main(["upgrade"]) == 0
 
-    assert invocations[0][0] == ("uv", "tool", "upgrade", "wecom-aibot")
-    assert invocations[0][1]["shell"] is False
-    assert "upgrade_complete" in capsys.readouterr().out
+    upgrade_calls = [
+        invocation
+        for invocation in invocations
+        if invocation[0][1:] == cli.UPGRADE_ARGUMENTS
+    ]
+    assert upgrade_calls[0][0] == (str(uv), "tool", "upgrade", "wecom-aibot")
+    assert upgrade_calls[0][1]["shell"] is False
+    assert (str(target), cli.VERIFY_INSTALL_COMMAND) in [item[0] for item in invocations]
+    captured = capsys.readouterr()
+    assert "upgrade_complete" in captured.out
+    assert '"version": "1.1.0"' in captured.out
 
 
 def test_upgrade_declined_by_user_does_not_run_command(monkeypatch, capsys):
@@ -681,21 +749,14 @@ def test_upgrade_declined_by_user_does_not_run_command(monkeypatch, capsys):
     assert "upgrade_declined" in capsys.readouterr().err
 
 
-def test_upgrade_with_yes_skips_prompt(monkeypatch):
-    monkeypatch.setattr(cli, "installed_version", lambda: "1.0.0")
-    monkeypatch.setattr(cli, "fetch_latest_version", lambda: "1.1.0")
-    monkeypatch.setattr(
-        cli,
-        "verify_installed_distribution",
-        lambda: cli.IntegrityReport(verified=3, skipped=0, failures=()),
-    )
+def test_upgrade_with_yes_skips_prompt(tmp_path, monkeypatch):
+    _stub_upgrade_environment(tmp_path, monkeypatch)
     _interactive(monkeypatch, tty=False)
 
     def refuse_input(prompt: str = "") -> str:
         raise AssertionError("must not prompt")
 
     monkeypatch.setattr("builtins.input", refuse_input)
-    monkeypatch.setattr(cli.subprocess, "run", lambda args, **kwargs: _completed(0))
 
     assert main(["upgrade", "--yes"]) == 0
 
@@ -755,20 +816,19 @@ def test_upgrade_reports_unparsable_version(monkeypatch, capsys):
 def test_upgrade_reports_missing_uv(monkeypatch, capsys):
     monkeypatch.setattr(cli, "installed_version", lambda: "1.0.0")
     monkeypatch.setattr(cli, "fetch_latest_version", lambda: "1.1.0")
-
-    def missing(args, **kwargs):
-        raise FileNotFoundError("uv")
-
-    monkeypatch.setattr(cli.subprocess, "run", missing)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    _no_subprocess(monkeypatch)
 
     assert main(["upgrade", "--yes"]) == 6
     assert "uv_not_found" in capsys.readouterr().err
 
 
-def test_upgrade_reports_failed_command(monkeypatch, capsys):
-    monkeypatch.setattr(cli, "installed_version", lambda: "1.0.0")
-    monkeypatch.setattr(cli, "fetch_latest_version", lambda: "1.1.0")
-    monkeypatch.setattr(cli.subprocess, "run", lambda args, **kwargs: _completed(2))
+def test_upgrade_reports_failed_command(tmp_path, monkeypatch, capsys):
+    invocations, _, _ = _stub_upgrade_environment(
+        tmp_path,
+        monkeypatch,
+        upgrade_returncode=2,
+    )
 
     def unreachable_verify() -> cli.IntegrityReport:
         raise AssertionError("verification must not run after a failed upgrade")
@@ -777,19 +837,18 @@ def test_upgrade_reports_failed_command(monkeypatch, capsys):
 
     assert main(["upgrade", "--yes"]) == 1
     assert "upgrade_failed" in capsys.readouterr().err
+    assert not any(invocation[0][-1:] == (cli.VERIFY_INSTALL_COMMAND,) for invocation in invocations)
 
 
-def test_upgrade_fails_when_post_upgrade_checksums_mismatch(monkeypatch, capsys):
-    monkeypatch.setattr(cli, "installed_version", lambda: "1.0.0")
-    monkeypatch.setattr(cli, "fetch_latest_version", lambda: "1.1.0")
-    monkeypatch.setattr(cli.subprocess, "run", lambda args, **kwargs: _completed(0))
-    monkeypatch.setattr(
-        cli,
-        "verify_installed_distribution",
-        lambda: cli.IntegrityReport(
+def test_upgrade_fails_when_post_upgrade_checksums_mismatch(tmp_path, monkeypatch, capsys):
+    _stub_upgrade_environment(
+        tmp_path,
+        monkeypatch,
+        verify_stdout=_verify_document(
+            version="1.1.0",
             verified=4,
             skipped=1,
-            failures=(("wecom_aibot/cli.py", "digest_mismatch"),),
+            failures=[{"path": "wecom_aibot/cli.py", "reason": "digest_mismatch"}],
         ),
     )
 
@@ -799,15 +858,12 @@ def test_upgrade_fails_when_post_upgrade_checksums_mismatch(monkeypatch, capsys)
     assert "upgrade_complete" not in captured.out
 
 
-def test_upgrade_fails_when_record_is_missing(monkeypatch, capsys):
-    monkeypatch.setattr(cli, "installed_version", lambda: "1.0.0")
-    monkeypatch.setattr(cli, "fetch_latest_version", lambda: "1.1.0")
-    monkeypatch.setattr(cli.subprocess, "run", lambda args, **kwargs: _completed(0))
-
-    def missing_record() -> cli.IntegrityReport:
-        raise cli.CliError("record_missing", cli.EXIT_INTEGRITY_FAILED)
-
-    monkeypatch.setattr(cli, "verify_installed_distribution", missing_record)
+def test_upgrade_fails_when_record_is_missing(tmp_path, monkeypatch, capsys):
+    _stub_upgrade_environment(
+        tmp_path,
+        monkeypatch,
+        verify_stdout=_verify_document(error="record_missing"),
+    )
 
     assert main(["upgrade", "--yes"]) == 7
     captured = capsys.readouterr()
@@ -1043,23 +1099,13 @@ def test_digest_without_algorithm_fails_closed(tmp_path, monkeypatch):
 
 
 def test_verification_output_only_reports_relative_paths(tmp_path, monkeypatch, capsys):
-    data = b"data\n"
-    _install_distribution(
+    _stub_upgrade_environment(
         tmp_path,
         monkeypatch,
-        "report-dist",
-        files={"report_pkg/__init__.py": data},
-        rows=[],
-    )
-    (tmp_path / "site" / "report_pkg" / "__init__.py").write_bytes(b"other\n")
-    monkeypatch.setattr(cli, "installed_version", lambda: "1.0.0")
-    monkeypatch.setattr(cli, "fetch_latest_version", lambda: "1.1.0")
-    monkeypatch.setattr(cli.subprocess, "run", lambda args, **kwargs: _completed(0))
-    verify = cli.verify_installed_distribution
-    monkeypatch.setattr(
-        cli,
-        "verify_installed_distribution",
-        lambda: verify("report-dist"),
+        verify_stdout=_verify_document(
+            version="1.1.0",
+            failures=[{"path": "report_pkg/__init__.py", "reason": "digest_mismatch"}],
+        ),
     )
 
     assert main(["upgrade", "--yes"]) == 7
@@ -1068,3 +1114,371 @@ def test_verification_output_only_reports_relative_paths(tmp_path, monkeypatch, 
     assert "report_pkg/__init__.py" in captured.err
     assert str(tmp_path) not in captured.err
     assert "site-packages" not in captured.err
+
+
+# --------------------------------------------------------------------------
+# C1: verify the upgraded uv-tool target, not this interpreter
+# --------------------------------------------------------------------------
+
+
+def test_upgrade_verifies_the_uv_tool_target_not_the_current_interpreter(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    invocations, uv, target = _stub_upgrade_environment(tmp_path, monkeypatch)
+
+    def boom() -> cli.IntegrityReport:
+        raise AssertionError("must not verify the current interpreter")
+
+    monkeypatch.setattr(cli, "verify_installed_distribution", boom)
+
+    assert main(["upgrade", "--yes"]) == 0
+
+    commands = [invocation[0] for invocation in invocations]
+    assert (str(uv), "tool", "upgrade", "wecom-aibot") in commands
+    assert (str(target), cli.VERIFY_INSTALL_COMMAND) in commands
+    assert all(command[:1] != (sys.executable,) for command in commands)
+    captured = capsys.readouterr()
+    assert "upgrade_complete" in captured.out
+    assert '"version": "1.1.0"' in captured.out
+
+
+def test_upgrade_fails_when_target_version_is_unchanged(tmp_path, monkeypatch, capsys):
+    _stub_upgrade_environment(
+        tmp_path,
+        monkeypatch,
+        current="1.0.0",
+        latest="1.1.0",
+        verify_stdout=_verify_document(version="1.0.0"),
+    )
+
+    assert main(["upgrade", "--yes"]) == 7
+    captured = capsys.readouterr()
+    assert "version_not_upgraded" in captured.err
+    assert "upgrade_complete" not in captured.out
+
+
+def test_upgrade_fails_when_target_version_does_not_match_pypi_latest(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _stub_upgrade_environment(
+        tmp_path,
+        monkeypatch,
+        latest="1.2.0",
+        verify_stdout=_verify_document(version="1.1.0"),
+    )
+
+    assert main(["upgrade", "--yes"]) == 7
+    captured = capsys.readouterr()
+    assert "version_not_upgraded" in captured.err
+    assert "upgrade_complete" not in captured.out
+
+
+def test_upgrade_refuses_when_uv_tool_target_is_missing(tmp_path, monkeypatch, capsys):
+    invocations, _, _ = _stub_upgrade_environment(
+        tmp_path,
+        monkeypatch,
+        list_output="other-tool 2.0.0\n",
+    )
+
+    assert main(["upgrade", "--yes"]) == 7
+    captured = capsys.readouterr()
+    assert "uv_tool_not_installed" in captured.err
+    assert "upgrade_complete" not in captured.out
+    assert not any(invocation[0][1:] == cli.UPGRADE_ARGUMENTS for invocation in invocations)
+
+
+def test_upgrade_invokes_uv_via_absolute_which_path(tmp_path, monkeypatch):
+    invocations, uv, _ = _stub_upgrade_environment(tmp_path, monkeypatch)
+
+    assert main(["upgrade", "--yes"]) == 0
+    assert all(invocation[0][0] != "uv" for invocation in invocations)
+    assert all(invocation[0][0] == str(uv) or invocation[0][0].endswith("wecom-aibot") for invocation in invocations)
+
+
+def test_upgrade_eof_during_confirmation_is_declined(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "installed_version", lambda: "1.0.0")
+    monkeypatch.setattr(cli, "fetch_latest_version", lambda: "1.1.0")
+    _interactive(monkeypatch)
+
+    def eof(_prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+    _no_subprocess(monkeypatch)
+
+    assert main(["upgrade"]) == 4
+    assert "upgrade_declined" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# I1: bounded RECORD reads fail closed without leaking paths
+# --------------------------------------------------------------------------
+
+
+def test_oversized_record_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "MAX_RECORD_BYTES", 32)
+    files = {"oversize_pkg/__init__.py": b"data\n"}
+    _install_distribution(tmp_path, monkeypatch, "oversize-dist", files=files, rows=[])
+    record = tmp_path / "site" / "oversize_dist-1.0.0.dist-info" / "RECORD"
+    record.write_text("x" * 64, encoding="utf-8")
+
+    with pytest.raises(cli.CliError) as error:
+        cli.verify_installed_distribution("oversize-dist")
+
+    assert error.value.code == "record_too_large"
+    assert error.value.exit_code == 7
+
+
+def test_record_invalid_utf8_fails_closed(tmp_path, monkeypatch):
+    files = {"badutf_pkg/__init__.py": b"data\n"}
+    _install_distribution(tmp_path, monkeypatch, "badutf-dist", files=files, rows=[])
+    record = tmp_path / "site" / "badutf_dist-1.0.0.dist-info" / "RECORD"
+    record.write_bytes(b"\xff\xfe not utf-8")
+
+    with pytest.raises(cli.CliError) as error:
+        cli.verify_installed_distribution("badutf-dist")
+
+    assert error.value.code == "record_unreadable"
+    assert error.value.exit_code == 7
+
+
+def test_malformed_csv_record_fails_closed(tmp_path, monkeypatch):
+    files = {"badcsv_pkg/__init__.py": b"data\n"}
+    _install_distribution(tmp_path, monkeypatch, "badcsv-dist", files=files, rows=[])
+    record = tmp_path / "site" / "badcsv_dist-1.0.0.dist-info" / "RECORD"
+    record.write_text('pkg/__init__.py,"unclosed-hash\n', encoding="utf-8")
+
+    with pytest.raises(cli.CliError) as error:
+        cli.verify_installed_distribution("badcsv-dist")
+
+    assert error.value.code == "record_unreadable"
+    assert error.value.exit_code == 7
+
+
+def test_unreadable_record_oserror_fails_closed(tmp_path, monkeypatch):
+    files = {"iorecord_pkg/__init__.py": b"data\n"}
+    _install_distribution(tmp_path, monkeypatch, "iorecord-dist", files=files, rows=[])
+    record = tmp_path / "site" / "iorecord_dist-1.0.0.dist-info" / "RECORD"
+    record.chmod(0o000)
+
+    try:
+        with pytest.raises(cli.CliError) as error:
+            cli.verify_installed_distribution("iorecord-dist")
+    finally:
+        record.chmod(0o600)
+
+    assert error.value.code == "record_unreadable"
+    assert error.value.exit_code == 7
+
+
+def test_record_read_errors_exit_7_without_traceback_or_paths(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _stub_upgrade_environment(
+        tmp_path,
+        monkeypatch,
+        verify_stdout=_verify_document(error="record_unreadable"),
+    )
+
+    assert main(["upgrade", "--yes"]) == 7
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "record_unreadable" in captured.err
+    assert "upgrade_complete" not in captured.out
+    assert "Traceback" not in combined
+    assert str(tmp_path) not in combined
+    assert str(tmp_path.resolve()) not in combined
+
+
+# --------------------------------------------------------------------------
+# I2: leftover endpoints stay put; signals request a controlled stop
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name == "nt", reason="unix leftover socket")
+def test_leftover_socket_with_token_is_already_running(
+    short_runtime_dir,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret: FakeAdapter())
+    base = short_runtime_dir / "relay.sock"
+    base.write_bytes(b"stale-socket")
+    token = Path(f"{base}.token")
+    token.write_text("old-token", encoding="utf-8")
+    token.chmod(0o600)
+
+    with pytest.raises(cli.CliError) as error:
+        asyncio.run(cli.serve_relay(base, "bot", "secret", None, 60.0))
+
+    assert error.value.code == "relay_already_running"
+    assert base.exists()
+    assert token.exists()
+    assert token.read_text(encoding="utf-8") == "old-token"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="unix leftover socket")
+def test_leftover_socket_without_token_is_stale_endpoint(short_runtime_dir, monkeypatch):
+    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret: FakeAdapter())
+    base = short_runtime_dir / "relay.sock"
+    base.write_bytes(b"stale-socket")
+
+    with pytest.raises(cli.CliError) as error:
+        asyncio.run(cli.serve_relay(base, "bot", "secret", None, 60.0))
+
+    assert error.value.code == "stale_endpoint"
+    assert base.exists()
+    assert not Path(f"{base}.token").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="unix leftover endpoint")
+def test_leftover_endpoint_file_is_stale_and_not_deleted(short_runtime_dir, monkeypatch):
+    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret: FakeAdapter())
+    base = short_runtime_dir / "relay.sock"
+    leftover = Path(f"{base}.endpoint")
+    leftover.write_text("unix:/old", encoding="utf-8")
+    leftover.chmod(0o600)
+
+    with pytest.raises(cli.CliError) as error:
+        asyncio.run(cli.serve_relay(base, "bot", "secret", None, 60.0))
+
+    assert error.value.code == "stale_endpoint"
+    assert leftover.exists()
+    assert leftover.read_text(encoding="utf-8") == "unix:/old"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="unix signals")
+def test_sigterm_requests_controlled_stop(short_runtime_dir, monkeypatch):
+    adapter = FakeAdapter()
+    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret: adapter)
+    runtime_dir = short_runtime_dir
+    base = runtime_dir / "relay.sock"
+
+    async def run() -> None:
+        ready = asyncio.Event()
+        served = asyncio.create_task(
+            cli.serve_relay(base, "bot", "secret", None, 60.0, ready=ready)
+        )
+        await _wait_until_ready(ready, served)
+        os.kill(os.getpid(), signal.SIGTERM)
+        assert await asyncio.wait_for(served, 5) == 0
+
+    asyncio.run(run())
+
+    assert adapter.inbound_stopped is True
+    assert adapter.disconnected is True
+    assert not (runtime_dir / "relay.sock.endpoint").exists()
+    assert not (runtime_dir / "relay.sock.token").exists()
+
+
+# --------------------------------------------------------------------------
+# I3: stop keeps reply IPC open while handlers drain
+# --------------------------------------------------------------------------
+
+
+def _blocking_handler_script(tmp_path: Path) -> Path:
+    script = tmp_path / "blocking_handler.py"
+    script.write_text(
+        "import pathlib, sys, time\n"
+        "payload = sys.stdin.read()\n"
+        "pathlib.Path(sys.argv[1]).write_text(payload + '\\n', encoding='utf-8')\n"
+        "gate = pathlib.Path(sys.argv[2])\n"
+        "for _ in range(400):\n"
+        "    if gate.exists():\n"
+        "        break\n"
+        "    time.sleep(0.05)\n",
+        encoding="utf-8",
+    )
+    return script
+
+
+@pytest.mark.skipif(os.name == "nt", reason="unix socket lifecycle")
+def test_reply_succeeds_during_handler_drain_after_stop(
+    tmp_path,
+    short_runtime_dir,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret: adapter)
+    runtime_dir = short_runtime_dir
+    base = runtime_dir / "relay.sock"
+    handler_output = tmp_path / "handler.jsonl"
+    gate = tmp_path / "continue"
+    handler_argv = [
+        sys.executable,
+        str(_blocking_handler_script(tmp_path)),
+        str(handler_output),
+        str(gate),
+    ]
+
+    async def run() -> None:
+        ready = asyncio.Event()
+        served = asyncio.create_task(
+            cli.serve_relay(base, "bot", "secret", handler_argv, 60.0, ready=ready)
+        )
+        await _wait_until_ready(ready, served)
+
+        adapter.callback(
+            TextEvent(
+                event_id="msg-drain",
+                text="hello",
+                route=ReplyRoute(req_id="req-drain", stream_id="stream-drain"),
+            )
+        )
+        payload = await _await_handler_payload(handler_output)
+        token = (runtime_dir / "relay.sock.token").read_text(encoding="utf-8")
+        endpoint = (runtime_dir / "relay.sock.endpoint").read_text(encoding="utf-8")
+
+        stopping = await ipc_request(endpoint, token, {"action": "stop"})
+        assert stopping == {"status": "stopping"}
+        for _ in range(50):
+            if adapter.inbound_stopped:
+                break
+            await asyncio.sleep(0.01)
+        assert adapter.inbound_stopped is True
+        assert adapter.disconnected is False
+
+        delivered = await ipc_request(
+            endpoint,
+            token,
+            {
+                "action": "reply",
+                "context": payload["replyContext"],
+                "kind": "final",
+                "markdown": "drained",
+            },
+        )
+        assert delivered == {"status": "delivered"}
+        gate.write_text("ok", encoding="utf-8")
+        assert await asyncio.wait_for(served, 5) == 0
+
+    asyncio.run(run())
+
+    assert adapter.replies == [(ReplyRoute("req-drain", "stream-drain"), "drained")]
+    assert adapter.disconnected is True
+
+
+def test_handler_done_callback_retrieves_task_exception():
+    class BoomService:
+        async def handle_text(self, *args: object, **kwargs: object) -> str:
+            raise RuntimeError("handler boom")
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        seen: list[object] = []
+        loop.set_exception_handler(lambda _loop, context: seen.append(context))
+        dispatcher = cli.HandlerDispatcher(BoomService(), None)  # type: ignore[arg-type]
+        dispatcher.dispatch(
+            TextEvent("msg-1", "hello", ReplyRoute("req-1", "stream-1"))
+        )
+        await asyncio.sleep(0.05)
+        await dispatcher.aclose()
+        assert seen == []
+
+    asyncio.run(run())

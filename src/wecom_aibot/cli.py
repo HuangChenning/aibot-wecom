@@ -14,13 +14,16 @@ import ntpath
 import os
 import re
 import secrets
+import shutil
+import signal
 import stat
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,11 +60,25 @@ HANDLER_DRAIN_TIMEOUT_SECONDS = 30.0
 
 DISTRIBUTION_NAME = "wecom-aibot"
 PYPI_JSON_URL = "https://pypi.org/pypi/wecom-aibot/json"
-UPGRADE_COMMAND: tuple[str, ...] = ("uv", "tool", "upgrade", "wecom-aibot")
+UV_EXECUTABLE_NAME = "uv"
+UPGRADE_ARGUMENTS: tuple[str, ...] = ("tool", "upgrade", DISTRIBUTION_NAME)
+UV_TOOL_BIN_ARGUMENTS: tuple[str, ...] = ("tool", "dir", "--bin")
+UV_TOOL_LIST_ARGUMENTS: tuple[str, ...] = ("tool", "list")
+VERIFY_INSTALL_COMMAND = "__verify-install"
+VERIFY_SCHEMA = "wecom-aibot/verify-install"
+VERIFY_PROTOCOL_VERSION = 1
 PYPI_TIMEOUT_SECONDS = 10.0
+UV_DISCOVERY_TIMEOUT_SECONDS = 30.0
+VERIFY_TIMEOUT_SECONDS = 120.0
 MAX_PYPI_RESPONSE_BYTES = 1_048_576
+MAX_UV_OUTPUT_BYTES = 1_048_576
+MAX_VERIFY_OUTPUT_BYTES = 262_144
 ALLOWED_RECORD_ALGORITHMS = frozenset({"sha256", "sha384", "sha512"})
 MAX_REPORTED_FAILURES = 10
+MAX_RECORD_BYTES = 4_194_304
+MAX_RECORD_ROWS = 50_000
+MAX_RECORD_FIELDS = 8
+MAX_RECORD_FIELD_LENGTH = 4096
 _BASE64_URLSAFE_PATTERN = re.compile(r"\A[A-Za-z0-9_-]+\Z")
 
 _WINDOWS_PRIVATE_DIR_SDDL = "D:P(A;OICI;FA;;;OW)"
@@ -338,7 +355,12 @@ class HandlerDispatcher:
             self._seen.popitem(last=False)
         task = asyncio.create_task(self._run(event))
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._handler_done)
+
+    def _handler_done(self, task: asyncio.Task[None]) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
 
     async def _run(self, event: TextEvent) -> None:
         context = await self._service.handle_text(
@@ -410,6 +432,36 @@ def _emit_error_stream(event: dict[str, object]) -> None:
     print(json.dumps(event, ensure_ascii=False, sort_keys=True), file=sys.stderr)
 
 
+def _endpoint_conflict_code(base: Path) -> str:
+    """Residue with a live token means a relay owns the endpoint."""
+    return (
+        "relay_already_running"
+        if Path(f"{base}.token").exists()
+        else "stale_endpoint"
+    )
+
+
+@contextmanager
+def _stop_signals(server: IpcServer) -> Iterator[None]:
+    """Turn SIGINT/SIGTERM into the same controlled stop as the stop command."""
+    loop = asyncio.get_running_loop()
+    installed: list[int] = []
+    for number in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(number, server.request_stop)
+        except (NotImplementedError, RuntimeError, ValueError, AttributeError):
+            continue
+        installed.append(number)
+    try:
+        yield
+    finally:
+        for number in installed:
+            try:
+                loop.remove_signal_handler(number)
+            except (NotImplementedError, RuntimeError, ValueError):
+                continue
+
+
 async def serve_relay(
     base: Path,
     bot_id: str,
@@ -424,21 +476,40 @@ async def serve_relay(
     dispatcher = HandlerDispatcher(service, handler_argv)
     adapter.on_text(dispatcher.dispatch)
 
-    server = IpcServer(service, secrets.token_urlsafe(32))
-    await server.start(str(base))
-    endpoint_file = Path(f"{base}.endpoint")
+    server = IpcServer(service, secrets.token_urlsafe(32), defer_close_on_stop=True)
     try:
-        ipc._write_token_file(str(endpoint_file), server.endpoint)
-        await adapter.connect()
-        _emit({"event": "serving"})
-        if ready is not None:
-            ready.set()
-        await server.wait_stopped()
+        await server.start(str(base))
+    except FileExistsError as error:
+        raise CliError(_endpoint_conflict_code(base)) from error
+    except OSError as error:
+        raise CliError("endpoint_unavailable") from error
+
+    endpoint_file = Path(f"{base}.endpoint")
+    endpoint_written = False
+    try:
+        try:
+            ipc._write_token_file(str(endpoint_file), server.endpoint)
+        except FileExistsError as error:
+            raise CliError("stale_endpoint") from error
+        endpoint_written = True
+        with _stop_signals(server):
+            await adapter.connect()
+            _emit({"event": "serving"})
+            if ready is not None:
+                ready.set()
+            await server.wait_stop_requested()
     finally:
-        endpoint_file.unlink(missing_ok=True)
-        await dispatcher.aclose()
+        # Stop accepting new work first, let running handlers finish replying
+        # over the still-open IPC endpoint, and only then tear everything down.
+        adapter.stop_inbound()
+        try:
+            await dispatcher.aclose()
+        except asyncio.CancelledError:
+            pass
         adapter.disconnect()
         await server.close()
+        if endpoint_written:
+            endpoint_file.unlink(missing_ok=True)
     return EXIT_OK
 
 
@@ -644,6 +715,53 @@ def _verify_record_entry(
     return None
 
 
+def _read_record_text(distribution: importlib.metadata.Distribution) -> str:
+    """Read RECORD with a byte ceiling before it reaches memory as text."""
+    dist_info = getattr(distribution, "_path", None)
+    if isinstance(dist_info, Path):
+        record_path = dist_info / "RECORD"
+        try:
+            with record_path.open("rb") as handle:
+                raw = handle.read(MAX_RECORD_BYTES + 1)
+        except FileNotFoundError as error:
+            raise CliError("record_missing", EXIT_INTEGRITY_FAILED) from error
+        except OSError as error:
+            raise CliError("record_unreadable", EXIT_INTEGRITY_FAILED) from error
+        if len(raw) > MAX_RECORD_BYTES:
+            raise CliError("record_too_large", EXIT_INTEGRITY_FAILED)
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise CliError("record_unreadable", EXIT_INTEGRITY_FAILED) from error
+
+    try:
+        record = distribution.read_text("RECORD")
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise CliError("record_unreadable", EXIT_INTEGRITY_FAILED) from error
+    if record is None:
+        raise CliError("record_missing", EXIT_INTEGRITY_FAILED)
+    if len(record.encode("utf-8", "surrogatepass")) > MAX_RECORD_BYTES:
+        raise CliError("record_too_large", EXIT_INTEGRITY_FAILED)
+    return record
+
+
+def _record_rows(record: str) -> list[list[str]]:
+    rows: list[list[str]] = []
+    try:
+        for row in csv.reader(io.StringIO(record, newline=""), strict=True):
+            if len(rows) >= MAX_RECORD_ROWS:
+                raise CliError("record_too_large", EXIT_INTEGRITY_FAILED)
+            if len(row) > MAX_RECORD_FIELDS:
+                raise CliError("record_too_large", EXIT_INTEGRITY_FAILED)
+            for value in row:
+                if len(value) > MAX_RECORD_FIELD_LENGTH:
+                    raise CliError("record_too_large", EXIT_INTEGRITY_FAILED)
+            rows.append(row)
+    except csv.Error as error:
+        raise CliError("record_unreadable", EXIT_INTEGRITY_FAILED) from error
+    return rows
+
+
 def verify_installed_distribution(
     name: str = DISTRIBUTION_NAME,
 ) -> IntegrityReport:
@@ -654,15 +772,12 @@ def verify_installed_distribution(
     except importlib.metadata.PackageNotFoundError as error:
         raise CliError("distribution_not_found", EXIT_INTEGRITY_FAILED) from error
 
-    record = distribution.read_text("RECORD")
-    if record is None:
-        raise CliError("record_missing", EXIT_INTEGRITY_FAILED)
-
+    rows = _record_rows(_read_record_text(distribution))
     roots = _install_roots(Path(distribution.locate_file("")).resolve())
     verified = 0
     skipped = 0
     failures: list[tuple[str, str]] = []
-    for row in csv.reader(io.StringIO(record, newline="")):
+    for row in rows:
         if not row or not row[0]:
             continue
         entry = row[0]
@@ -677,7 +792,10 @@ def verify_installed_distribution(
         if target is None:
             failures.append((display, "path_escape"))
             continue
-        outcome = _verify_record_entry(target, digest_spec, size_spec)
+        try:
+            outcome = _verify_record_entry(target, digest_spec, size_spec)
+        except OSError:
+            outcome = "unreadable"
         if outcome is None:
             verified += 1
         else:
@@ -690,6 +808,225 @@ def verify_installed_distribution(
         skipped=skipped,
         failures=tuple(failures),
     )
+
+
+@dataclass(frozen=True)
+class UpgradeTarget:
+    """The uv tool installation that `uv tool upgrade` actually replaces."""
+
+    executable: Path
+
+
+@dataclass(frozen=True)
+class TargetVerification:
+    installed_version: str
+    report: IntegrityReport
+
+
+VERIFICATION_FAILED_MESSAGE = "upgrade executed but verification failed"
+
+
+def _require_trusted_executable(path: Path, code: str) -> Path:
+    """Reject executables an unprivileged local attacker could swap out."""
+    try:
+        resolved = path.resolve(strict=True)
+        info = resolved.stat()
+    except OSError as error:
+        raise CliError(code, EXIT_INTEGRITY_FAILED) from error
+    if not stat.S_ISREG(info.st_mode) or not os.access(resolved, os.X_OK):
+        raise CliError(code, EXIT_INTEGRITY_FAILED)
+    if os.name != "nt":
+        parent = resolved.parent.stat()
+        if stat.S_IMODE(info.st_mode) & 0o002 or stat.S_IMODE(parent.st_mode) & 0o002:
+            raise CliError(code, EXIT_INTEGRITY_FAILED)
+    return resolved
+
+
+def _resolve_uv_executable() -> Path:
+    discovered = shutil.which(UV_EXECUTABLE_NAME)
+    if not discovered:
+        raise CliError("uv_not_found", EXIT_MISSING_UV)
+    try:
+        return _require_trusted_executable(Path(discovered), "insecure_uv_executable")
+    except CliError as error:
+        if error.code == "insecure_uv_executable":
+            raise
+        raise CliError("uv_not_found", EXIT_MISSING_UV) from error
+
+
+def _run_uv(uv: Path, arguments: Sequence[str]) -> str:
+    try:
+        completed = subprocess.run(
+            [str(uv), *arguments],
+            shell=False,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=UV_DISCOVERY_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError as error:
+        raise CliError("uv_not_found", EXIT_MISSING_UV) from error
+    except (OSError, subprocess.SubprocessError) as error:
+        raise CliError("uv_tool_query_failed", EXIT_INTEGRITY_FAILED) from error
+    if completed.returncode != 0:
+        raise CliError("uv_tool_query_failed", EXIT_INTEGRITY_FAILED)
+    stdout = completed.stdout or ""
+    if len(stdout) > MAX_UV_OUTPUT_BYTES:
+        raise CliError("uv_tool_query_failed", EXIT_INTEGRITY_FAILED)
+    return stdout
+
+
+def discover_upgrade_target(uv: Path) -> UpgradeTarget:
+    """Locate the single uv tool executable that the upgrade will replace."""
+    listed = _run_uv(uv, UV_TOOL_LIST_ARGUMENTS)
+    installed = any(
+        line.split()[:1] == [DISTRIBUTION_NAME]
+        for line in listed.splitlines()
+        if line.strip()
+    )
+    if not installed:
+        raise CliError("uv_tool_not_installed", EXIT_INTEGRITY_FAILED)
+
+    bin_output = _run_uv(uv, UV_TOOL_BIN_ARGUMENTS).strip()
+    if not bin_output:
+        raise CliError("uv_tool_target_not_found", EXIT_INTEGRITY_FAILED)
+    bin_dir = Path(bin_output)
+    if not bin_dir.is_dir():
+        raise CliError("uv_tool_target_not_found", EXIT_INTEGRITY_FAILED)
+
+    names = (
+        (f"{DISTRIBUTION_NAME}.exe",) if os.name == "nt" else (DISTRIBUTION_NAME,)
+    )
+    candidates = [bin_dir / name for name in names if (bin_dir / name).exists()]
+    if len(candidates) != 1:
+        raise CliError("uv_tool_target_not_found", EXIT_INTEGRITY_FAILED)
+    return UpgradeTarget(
+        executable=_require_trusted_executable(
+            candidates[0],
+            "uv_tool_target_not_found",
+        )
+    )
+
+
+def _parse_verification(document: object) -> TargetVerification:
+    if not isinstance(document, dict):
+        raise CliError("verification_protocol_invalid", EXIT_INTEGRITY_FAILED)
+    if (
+        document.get("schema") != VERIFY_SCHEMA
+        or document.get("version") != VERIFY_PROTOCOL_VERSION
+    ):
+        raise CliError("verification_protocol_invalid", EXIT_INTEGRITY_FAILED)
+    if "error" in document:
+        code = document["error"]
+        raise CliError(
+            code if isinstance(code, str) and code.isidentifier() else "verification_failed",
+            EXIT_INTEGRITY_FAILED,
+        )
+
+    version_text = document.get("installedVersion")
+    verified = document.get("verified")
+    skipped = document.get("skipped")
+    failures = document.get("failures")
+    if (
+        not isinstance(version_text, str)
+        or not isinstance(verified, int)
+        or isinstance(verified, bool)
+        or not isinstance(skipped, int)
+        or isinstance(skipped, bool)
+        or verified < 0
+        or skipped < 0
+        or not isinstance(failures, list)
+        or len(failures) > MAX_RECORD_ROWS
+    ):
+        raise CliError("verification_protocol_invalid", EXIT_INTEGRITY_FAILED)
+
+    parsed: list[tuple[str, str]] = []
+    for failure in failures:
+        if not isinstance(failure, dict):
+            raise CliError("verification_protocol_invalid", EXIT_INTEGRITY_FAILED)
+        path = failure.get("path")
+        reason = failure.get("reason")
+        if not isinstance(path, str) or not isinstance(reason, str):
+            raise CliError("verification_protocol_invalid", EXIT_INTEGRITY_FAILED)
+        if os.path.isabs(path) or ntpath.isabs(path):
+            raise CliError("verification_protocol_invalid", EXIT_INTEGRITY_FAILED)
+        parsed.append((path[:MAX_RECORD_FIELD_LENGTH], reason[:64]))
+
+    return TargetVerification(
+        installed_version=version_text,
+        report=IntegrityReport(
+            verified=verified,
+            skipped=skipped,
+            failures=tuple(parsed),
+        ),
+    )
+
+
+def verify_upgrade_target(target: UpgradeTarget) -> TargetVerification:
+    """Ask the upgraded executable to verify its own installation."""
+    try:
+        completed = subprocess.run(
+            [str(target.executable), VERIFY_INSTALL_COMMAND],
+            shell=False,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=VERIFY_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise CliError("verification_unavailable", EXIT_INTEGRITY_FAILED) from error
+
+    stdout = completed.stdout or ""
+    if not stdout or len(stdout) > MAX_VERIFY_OUTPUT_BYTES:
+        raise CliError("verification_protocol_invalid", EXIT_INTEGRITY_FAILED)
+    try:
+        document = json.loads(stdout)
+    except (json.JSONDecodeError, RecursionError) as error:
+        raise CliError("verification_protocol_invalid", EXIT_INTEGRITY_FAILED) from error
+    return _parse_verification(document)
+
+
+def run_verify_install() -> int:
+    """Hidden self-check executed inside the installed environment."""
+    payload: dict[str, object] = {
+        "schema": VERIFY_SCHEMA,
+        "version": VERIFY_PROTOCOL_VERSION,
+    }
+    try:
+        report = verify_installed_distribution()
+    except CliError as error:
+        payload["error"] = error.code
+        _emit(payload)
+        return EXIT_INTEGRITY_FAILED
+
+    payload.update(
+        {
+            "installedVersion": installed_version(),
+            "verified": report.verified,
+            "skipped": report.skipped,
+            "failures": [
+                {"path": path, "reason": reason}
+                for path, reason in report.failures[:MAX_REPORTED_FAILURES]
+            ],
+        }
+    )
+    _emit(payload)
+    return EXIT_OK if not report.failures else EXIT_INTEGRITY_FAILED
+
+
+def _confirm_upgrade(current: Version, latest: Version) -> int | None:
+    if not _is_interactive():
+        _emit_error("confirmation_required")
+        return EXIT_NOT_INTERACTIVE
+    try:
+        answer = input(f"Upgrade {DISTRIBUTION_NAME} {current} -> {latest}? [y/N]: ")
+    except EOFError:
+        _emit_error("upgrade_declined")
+        return EXIT_DECLINED
+    if answer.strip().lower() not in {"y", "yes"}:
+        _emit_error("upgrade_declined")
+        return EXIT_DECLINED
+    return None
 
 
 def run_upgrade(*, assume_yes: bool) -> int:
@@ -728,20 +1065,30 @@ def run_upgrade(*, assume_yes: bool) -> int:
         return EXIT_OK
 
     if not assume_yes:
-        if not _is_interactive():
-            _emit_error("confirmation_required")
-            return EXIT_NOT_INTERACTIVE
-        answer = input(f"Upgrade {DISTRIBUTION_NAME} {current} -> {latest}? [y/N]: ")
-        if answer.strip().lower() not in {"y", "yes"}:
-            _emit_error("upgrade_declined")
-            return EXIT_DECLINED
+        declined = _confirm_upgrade(current, latest)
+        if declined is not None:
+            return declined
 
     try:
-        completed = subprocess.run(list(UPGRADE_COMMAND), shell=False, check=False)
+        uv = _resolve_uv_executable()
+        target = discover_upgrade_target(uv)
+    except CliError as error:
+        _emit_error(
+            error.code,
+            message="upgrade not attempted; verification target not located",
+        )
+        return error.exit_code
+
+    try:
+        completed = subprocess.run(
+            [str(uv), *UPGRADE_ARGUMENTS],
+            shell=False,
+            check=False,
+        )
     except FileNotFoundError:
         _emit_error("uv_not_found")
         return EXIT_MISSING_UV
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
         _emit_error("upgrade_failed")
         return EXIT_FAILED
     if completed.returncode != 0:
@@ -749,18 +1096,29 @@ def run_upgrade(*, assume_yes: bool) -> int:
         return EXIT_FAILED
 
     try:
-        report = verify_installed_distribution()
+        verification = verify_upgrade_target(target)
+        verified_version = Version(verification.installed_version)
     except CliError as error:
+        _emit_error(error.code, message=VERIFICATION_FAILED_MESSAGE)
+        return EXIT_INTEGRITY_FAILED
+    except InvalidVersion:
+        _emit_error("verification_protocol_invalid", message=VERIFICATION_FAILED_MESSAGE)
+        return EXIT_INTEGRITY_FAILED
+
+    if verified_version != latest or verified_version < current:
         _emit_error(
-            error.code,
-            message="upgrade executed but integrity verification failed",
+            "version_not_upgraded",
+            message=VERIFICATION_FAILED_MESSAGE,
+            expected=str(latest),
+            installed=str(verified_version),
         )
         return EXIT_INTEGRITY_FAILED
 
+    report = verification.report
     if report.failures:
         _emit_error(
             "integrity_failed",
-            message="upgrade executed but integrity verification failed",
+            message=VERIFICATION_FAILED_MESSAGE,
             verified=report.verified,
             skipped=report.skipped,
             failed=len(report.failures),
@@ -774,7 +1132,7 @@ def run_upgrade(*, assume_yes: bool) -> int:
     _emit(
         {
             "event": "upgrade_complete",
-            "version": str(latest),
+            "version": str(verified_version),
             "verified": report.verified,
             "skipped": report.skipped,
         }
@@ -792,7 +1150,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="wecom-aibot",
         description="Enterprise WeChat smart bot relay",
     )
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="{serve,reply,status,stop,upgrade}",
+    )
 
     serve = commands.add_parser("serve", help="run the relay process")
     serve.add_argument("--endpoint")
@@ -823,6 +1185,9 @@ def build_parser() -> argparse.ArgumentParser:
     upgrade = commands.add_parser("upgrade", help="upgrade from PyPI with uv")
     upgrade.add_argument("--yes", action="store_true")
 
+    # Internal, fixed-argument self-check invoked on the upgraded executable.
+    commands.add_parser(VERIFY_INSTALL_COMMAND, help=argparse.SUPPRESS)
+
     return parser
 
 
@@ -838,6 +1203,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_control("status", args.endpoint, _STATUS_EXITS)
         if args.command == "stop":
             return _run_control("stop", args.endpoint, _STOP_EXITS)
+        if args.command == VERIFY_INSTALL_COMMAND:
+            return run_verify_install()
         return run_upgrade(assume_yes=args.yes)
     except CliError as error:
         _emit_error(error.code)
