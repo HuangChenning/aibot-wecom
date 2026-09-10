@@ -5,3 +5,8 @@ CLAUDE.md
 internal/
 rules/
 .worktrees/
+__pycache__/
+.it-*
+.local/
+.local/wecom-aibot.json
+.env
