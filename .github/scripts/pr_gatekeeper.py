@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 
 ALLOWED_VERDICTS = frozenset({"MERGEABLE", "NOT_MERGEABLE", "INCONCLUSIVE"})
 REQUIRED_CHECKS = frozenset({"ruff", "pytest"})
+REQUIRED_MODEL_KEYS = frozenset({"verdict", "acceptance_criteria", "observations"})
 
 
 @dataclass(frozen=True)
@@ -52,16 +53,13 @@ def parse_model_verdict(body: str) -> ModelVerdict:
     except json.JSONDecodeError:
         return ModelVerdict("INCONCLUSIVE", reason="Model response is not valid JSON.")
 
-    if not isinstance(payload, dict) or set(payload) != {
-        "verdict",
-        "acceptance_criteria",
-        "observations",
-    }:
+    selected = _verdict_payload(payload)
+    if selected is None:
         return ModelVerdict("INCONCLUSIVE", reason="Model response has an invalid schema.")
 
-    name = payload["verdict"]
-    criteria = payload["acceptance_criteria"]
-    observations = payload["observations"]
+    name = selected["verdict"]
+    criteria = selected["acceptance_criteria"]
+    observations = selected["observations"]
     if (
         name not in ALLOWED_VERDICTS
         or not isinstance(criteria, list)
@@ -71,6 +69,24 @@ def parse_model_verdict(body: str) -> ModelVerdict:
         return ModelVerdict("INCONCLUSIVE", reason="Model response has invalid values.")
 
     return ModelVerdict(name, tuple(criteria), tuple(observations))
+
+
+def _verdict_payload(payload: object) -> dict[str, object] | None:
+    """Find the verdict object, allowing extra keys or one layer of wrapping."""
+    if isinstance(payload, dict):
+        if REQUIRED_MODEL_KEYS.issubset(payload):
+            return payload
+        for value in payload.values():
+            nested = _verdict_payload(value)
+            if nested is not None:
+                return nested
+        return None
+    if isinstance(payload, list):
+        for item in payload:
+            nested = _verdict_payload(item)
+            if nested is not None:
+                return nested
+    return None
 
 
 def make_model_request(

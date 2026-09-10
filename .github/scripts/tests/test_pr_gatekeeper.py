@@ -100,6 +100,27 @@ class ModelVerdictTests(unittest.TestCase):
         self.assertEqual("MERGEABLE", verdict.name)
         self.assertEqual(("ruff",), verdict.acceptance_criteria)
 
+    def test_extra_model_keys_are_ignored(self) -> None:
+        body = (
+            '{"verdict":"MERGEABLE","acceptance_criteria":[],'
+            '"observations":[],"reason":"looks good","score":1}'
+        )
+
+        verdict = parse_model_verdict(body)
+
+        self.assertEqual("MERGEABLE", verdict.name)
+
+    def test_nested_model_object_is_accepted(self) -> None:
+        body = (
+            '{"review":{"verdict":"MERGEABLE","acceptance_criteria":["pytest"],'
+            '"observations":[]}}'
+        )
+
+        verdict = parse_model_verdict(body)
+
+        self.assertEqual("MERGEABLE", verdict.name)
+        self.assertEqual(("pytest",), verdict.acceptance_criteria)
+
     def test_empty_optional_model_configuration_uses_safe_defaults(self) -> None:
         request = make_model_request("", "", "secret-value", "prompt")
         payload = json.loads(request.data.decode("utf-8"))
