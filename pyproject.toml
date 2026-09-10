@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Enterprise WeChat smart bot relay"
 requires-python = ">=3.10"
 dependencies = [
+    "packaging",
     "wecom-aibot-python-sdk",
 ]
 
