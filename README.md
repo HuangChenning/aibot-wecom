@@ -42,16 +42,25 @@
 
 ## 安装与快速验证
 
-需要 Python 3.10+ 和 [uv](https://docs.astral.sh/uv/)。
+需要 Python 3.10+ 和 [uv](https://docs.astral.sh/uv/)。必须在**本仓库根目录**（有 `pyproject.toml` 的目录）执行 `uv sync`，不要在家目录或其他项目的虚拟环境里跑。
 
 ```bash
-python -m pip install uv
+# 推荐用官方安装器，避免依赖当前 python -m pip
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# 装好后确保 ~/.local/bin 在 PATH 中，必要时重新登录
+
+git clone https://github.com/HuangChenning/aibot-wecom.git
+cd aibot-wecom
 uv sync
 uv run pytest
 uv run ruff check .
 ```
 
+`uv` 已在 PATH 但当前目录没有本仓库时，`uv sync` 会报找不到 `pyproject.toml`，`uv run pytest` / `uv run ruff` 会报找不到可执行文件。先 `cd` 进仓库再执行。不要使用其他项目自带的 `python`（例如已剥离 pip 的 venv）。
+
 `uv sync` 会按 `uv.lock` 安装开发依赖，并把官方 SDK 钉在 `wecom-aibot-python-sdk==1.0.2`（失败分类依赖该版本的异常文案）。自动化测试使用 fake SDK，不会连接企业微信，也不需要配置凭据。
+
+Linux 上长期常驻 `serve` 时，不要依赖登录会话的 `$XDG_RUNTIME_DIR`（注销后 `/run/user/<uid>` 会被清掉）。显式设置 `WECOM_AIBOT_RUNTIME_DIR`（例如 `~/.wecom-aibot/run`），目录权限保持 `0700`。同一 Bot ID 同时只能有一条 WebSocket：上 Linux 前先停掉其他机器上的 `serve`。公司代理环境连企微时可能需要 `NO_PROXY='*'` 或排除 `openws.work.weixin.qq.com`。
 
 ## 环境变量
 
@@ -95,7 +104,23 @@ wecom-aibot serve
 wecom-aibot reply --context "$REPLY_CONTEXT" --content-file ./reply.md
 ```
 
-可选 `--endpoint` 指向正在运行的 relay。
+可选 `--endpoint` 指向正在运行的 relay。未在 PATH 中安装 CLI 时，用仓库里的解释器调用：
+
+```bash
+uv run --project /path/to/aibot-wecom wecom-aibot reply --context "$REPLY_CONTEXT" --content-file ./reply.md
+```
+
+### 其他 agent 如何回传
+
+其他 agent 不要自己连企微，也不要持有 Bot Secret。本机先有一条 `wecom-aibot serve`，再把 `skills/wecom-smart-bot-reply/` 交给该 agent 作为常驻 skill 或项目规则。
+
+每次任务还必须由入站消息带上不透明的 `replyContext`（Relay 通过 `--handler` 的 stdin JSON 下发）。agent 跑完业务 skill 后只做：
+
+1. `wecom-aibot status` 退出码为 `0`
+2. 把最终 Markdown 写入 UTF-8 文件
+3. `wecom-aibot reply --context "$REPLY_CONTEXT" --content-file ./reply.md`
+
+`replyContext` 不得打印或拆开。没有该令牌时不要回传，也不要用 Bot ID/Secret 另开连接。完整契约见 [`skills/wecom-smart-bot-reply/SKILL.md`](skills/wecom-smart-bot-reply/SKILL.md)。
 
 ### `status`
 
