@@ -48,7 +48,7 @@ def deterministic_verdict(
 
 def parse_model_verdict(body: str) -> ModelVerdict:
     try:
-        payload = json.loads(body)
+        payload = json.loads(_json_object_text(body))
     except json.JSONDecodeError:
         return ModelVerdict("INCONCLUSIVE", reason="Model response is not valid JSON.")
 
@@ -97,6 +97,35 @@ def make_model_request(
             "Content-Type": "application/json",
         },
     )
+
+
+def _json_object_text(body: str) -> str:
+    """Return the first JSON object in a model reply, ignoring fences or prose."""
+    start = body.find("{")
+    if start < 0:
+        return body
+    depth = 0
+    in_string = False
+    escape = False
+    for index, char in enumerate(body[start:], start):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return body[start : index + 1]
+    return body
 
 
 def evaluate_model(
