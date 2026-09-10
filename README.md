@@ -42,16 +42,25 @@
 
 ## 安装与快速验证
 
-需要 Python 3.10+ 和 [uv](https://docs.astral.sh/uv/)。
+需要 Python 3.10+ 和 [uv](https://docs.astral.sh/uv/)。必须在**本仓库根目录**（有 `pyproject.toml` 的目录）执行 `uv sync`，不要在家目录或其他项目的虚拟环境里跑。
 
 ```bash
-python -m pip install uv
+# 推荐用官方安装器，避免依赖当前 python -m pip
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# 装好后确保 ~/.local/bin 在 PATH 中，必要时重新登录
+
+git clone https://github.com/HuangChenning/aibot-wecom.git
+cd aibot-wecom
 uv sync
 uv run pytest
 uv run ruff check .
 ```
 
+`uv` 已在 PATH 但当前目录没有本仓库时，`uv sync` 会报找不到 `pyproject.toml`，`uv run pytest` / `uv run ruff` 会报找不到可执行文件。先 `cd` 进仓库再执行。不要使用其他项目自带的 `python`（例如已剥离 pip 的 venv）。
+
 `uv sync` 会按 `uv.lock` 安装开发依赖，并把官方 SDK 钉在 `wecom-aibot-python-sdk==1.0.2`（失败分类依赖该版本的异常文案）。自动化测试使用 fake SDK，不会连接企业微信，也不需要配置凭据。
+
+Linux 上长期常驻 `serve` 时，不要依赖登录会话的 `$XDG_RUNTIME_DIR`（注销后 `/run/user/<uid>` 会被清掉）。显式设置 `WECOM_AIBOT_RUNTIME_DIR`（例如 `~/.wecom-aibot/run`），目录权限保持 `0700`。同一 Bot ID 同时只能有一条 WebSocket：上 Linux 前先停掉其他机器上的 `serve`。公司代理环境连企微时可能需要 `NO_PROXY='*'` 或排除 `openws.work.weixin.qq.com`。
 
 ## 环境变量
 
@@ -63,6 +72,50 @@ uv run ruff check .
 | `WECOM_AIBOT_ENDPOINT` | 覆盖默认 IPC 端点路径（默认 `<运行目录>/relay.sock`）。 |
 
 `serve` 也可以用 `--config` 指向仅当前用户可读的 JSON，字段为 `botId` 与 `botSecret`。文件缺失、不是常规文件、或权限对组/其他人开放时，进程会拒绝启动。空白凭据同样会被拒绝。
+
+## Linux 上启动 Relay
+
+Linux 不要把凭据放在 `~/.local/wecom-aibot.json`：`~/.local` 常被 XDG 占用，容易变成「路径不存在」。推荐：
+
+```bash
+mkdir -p ~/.config/wecom-aibot ~/.wecom-aibot/run
+chmod 700 ~/.config/wecom-aibot ~/.wecom-aibot/run
+```
+
+编辑 `~/.config/wecom-aibot/relay.json`，填入**真实**的 Bot ID 和 Secret（不要把示例里的 `你的BotId` 原样保存），然后 `chmod 600` 该文件。JSON 形状如下，值不要提交到 git、也不要贴进聊天：
+
+```json
+{"botId":"...","botSecret":"..."}
+```
+
+用**一个长期开着的终端**跑 serve（出现 `"event": "serving"` 后不要关）：
+
+```bash
+cd ~/aibot-wecom
+export WECOM_AIBOT_RUNTIME_DIR="$HOME/.wecom-aibot/run"
+uv run wecom-aibot serve --config "$HOME/.config/wecom-aibot/relay.json"
+```
+
+**再开一个终端**查询；必须导出同一个运行目录，否则会报 `relay_not_running`：
+
+```bash
+cd ~/aibot-wecom
+export WECOM_AIBOT_RUNTIME_DIR="$HOME/.wecom-aibot/run"
+uv run wecom-aibot status
+```
+
+成功时应看到 `"status": "running"`。常见错误：
+
+| 代码 | 含义 |
+| --- | --- |
+| `missing_config` | `--config` 指向的路径没有普通文件 |
+| `insecure_config_permissions` | 配置对组/其他人可读，执行 `chmod 600` |
+| `missing_credentials` / `invalid_config` | 字段名不是 `botId`/`botSecret`，或仍是占位符/空值 |
+| `sdk_auth_failed` | Bot ID 与 Secret 不配对，或另一台机器占用了同一 Bot 的 WebSocket |
+| `relay_not_running` | 没有正在运行的 `serve`，或 `WECOM_AIBOT_RUNTIME_DIR` 与 serve 不一致 |
+| `unreadable_content_file` | `reply` 的 `--content-file` 不存在；先写好 Markdown 文件 |
+
+`reply` 还需要入站消息签发的 `replyContext`。serve 刚起来时不要空跑 `reply`；等企微里有人给机器人发消息，再把正文写入文件后调用。
 
 ## 命令
 
@@ -95,7 +148,23 @@ wecom-aibot serve
 wecom-aibot reply --context "$REPLY_CONTEXT" --content-file ./reply.md
 ```
 
-可选 `--endpoint` 指向正在运行的 relay。
+可选 `--endpoint` 指向正在运行的 relay。未在 PATH 中安装 CLI 时，用仓库里的解释器调用：
+
+```bash
+uv run --project /path/to/aibot-wecom wecom-aibot reply --context "$REPLY_CONTEXT" --content-file ./reply.md
+```
+
+### 其他 agent 如何回传
+
+其他 agent 不要自己连企微，也不要持有 Bot Secret。本机先有一条 `wecom-aibot serve`，再把 `skills/wecom-smart-bot-reply/` 交给该 agent 作为常驻 skill 或项目规则。
+
+每次任务还必须由入站消息带上不透明的 `replyContext`（Relay 通过 `--handler` 的 stdin JSON 下发）。agent 跑完业务 skill 后只做：
+
+1. `wecom-aibot status` 退出码为 `0`
+2. 把最终 Markdown 写入 UTF-8 文件
+3. `wecom-aibot reply --context "$REPLY_CONTEXT" --content-file ./reply.md`
+
+`replyContext` 不得打印或拆开。没有该令牌时不要回传，也不要用 Bot ID/Secret 另开连接。完整契约见 [`skills/wecom-smart-bot-reply/SKILL.md`](skills/wecom-smart-bot-reply/SKILL.md)。
 
 ### `status`
 
