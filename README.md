@@ -166,8 +166,6 @@ wecom-aibot upgrade --yes
 src/wecom_aibot/                 Relay 运行时
 tests/                           fake SDK 与行为测试
 skills/wecom-smart-bot-reply/    企业微信原会话回传 skill
-.github/scripts/                 PR Gatekeeper 裁决脚本
-.github/workflows/               GitHub Actions 门禁
 ```
 
 回传边界与失败策略见 [`skills/wecom-smart-bot-reply/references/relay-contract.md`](skills/wecom-smart-bot-reply/references/relay-contract.md)。
@@ -179,15 +177,3 @@ skills/wecom-smart-bot-reply/    企业微信原会话回传 skill
 - 第一版不包含多机器人、聊天历史数据库、Web 管理界面、主动推送、卡片工作流或图片/语音理解。
 - Windows IPC、DACL 与信号路径需要在 Windows CI 或实机上验证。
 - `wecom-aibot` 尚未发布到 PyPI；`upgrade` 的成功路径与真实 `uv tool upgrade` 交互仍未验证。
-
-## PR Gatekeeper
-
-仓库使用 **Gatekeeper Verification** 保护 `main`。PR 代码在不含 MiniMax 密钥的独立目录中运行 Ruff 和 pytest；裁决脚本来自可信的 PR Base SHA。只有验证证据、Head SHA 一致性和 MiniMax 审核都得到 `MERGEABLE`，检查才会通过。
-
-仓库管理员需要：
-
-1. 在 GitHub Actions Secrets 中配置 `MINIMAX_API_KEY`。
-2. 按需配置 `MINIMAX_BASE_URL` 与 `MINIMAX_MODEL` 变量。
-3. 在 `main` 分支保护中把 **Gatekeeper Verification** 设为必需检查。
-
-缺少密钥、锁文件或可复现证据会得到阻断性的 `INCONCLUSIVE`。不要把工作流改为 `pull_request_target`，也不要让检出的 PR Head 代码接触密钥。
