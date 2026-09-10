@@ -1377,6 +1377,54 @@ def test_sigterm_requests_controlled_stop(short_runtime_dir, monkeypatch):
     assert not (runtime_dir / "relay.sock.token").exists()
 
 
+class HangingConnectAdapter(FakeAdapter):
+    """connect() blocks until cancelled, matching a stuck SDK handshake."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.connect_started = asyncio.Event()
+        self.connect_cancelled = False
+
+    async def connect(self) -> None:
+        self.connect_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.connect_cancelled = True
+            raise
+        self.connected = True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="unix signals")
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_signal_during_hanging_connect_exits_without_waiting(
+    short_runtime_dir,
+    monkeypatch,
+    signum: int,
+):
+    adapter = HangingConnectAdapter()
+    monkeypatch.setattr(cli, "create_sdk_client", lambda bot_id, secret: adapter)
+    runtime_dir = short_runtime_dir
+    base = runtime_dir / "relay.sock"
+
+    async def run() -> None:
+        served = asyncio.create_task(
+            cli.serve_relay(base, "bot", "secret", None, 60.0)
+        )
+        await asyncio.wait_for(adapter.connect_started.wait(), 5)
+        os.kill(os.getpid(), signum)
+        assert await asyncio.wait_for(served, 2) == 0
+
+    asyncio.run(run())
+
+    assert adapter.connect_cancelled is True
+    assert adapter.connected is False
+    assert adapter.inbound_stopped is True
+    assert adapter.disconnected is True
+    assert not (runtime_dir / "relay.sock.endpoint").exists()
+    assert not (runtime_dir / "relay.sock.token").exists()
+
+
 # --------------------------------------------------------------------------
 # I3: stop keeps reply IPC open while handlers drain
 # --------------------------------------------------------------------------

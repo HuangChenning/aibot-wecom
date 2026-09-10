@@ -462,6 +462,34 @@ def _stop_signals(server: IpcServer) -> Iterator[None]:
                 continue
 
 
+async def _connect_until_stopped(adapter: object, server: IpcServer) -> bool:
+    """Connect unless stop wins first. Cancel a hanging handshake on stop."""
+    connect = asyncio.create_task(adapter.connect())  # type: ignore[attr-defined]
+    stop = asyncio.create_task(server.wait_stop_requested())
+    try:
+        await asyncio.wait(
+            {connect, stop},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    except asyncio.CancelledError:
+        connect.cancel()
+        stop.cancel()
+        await asyncio.gather(connect, stop, return_exceptions=True)
+        raise
+    if not connect.done():
+        connect.cancel()
+        await asyncio.gather(connect, return_exceptions=True)
+    if not stop.done():
+        stop.cancel()
+        await asyncio.gather(stop, return_exceptions=True)
+    if connect.cancelled():
+        return False
+    exception = connect.exception()
+    if exception is not None:
+        raise exception
+    return True
+
+
 async def serve_relay(
     base: Path,
     bot_id: str,
@@ -493,11 +521,12 @@ async def serve_relay(
             raise CliError("stale_endpoint") from error
         endpoint_written = True
         with _stop_signals(server):
-            await adapter.connect()
-            _emit({"event": "serving"})
-            if ready is not None:
-                ready.set()
-            await server.wait_stop_requested()
+            connected = await _connect_until_stopped(adapter, server)
+            if connected:
+                _emit({"event": "serving"})
+                if ready is not None:
+                    ready.set()
+                await server.wait_stop_requested()
     finally:
         # Stop accepting new work first, let running handlers finish replying
         # over the still-open IPC endpoint, and only then tear everything down.
